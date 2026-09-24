@@ -66,3 +66,30 @@ async def market():
         "vnindex": vnindex,
         "vn30": vn30
     }
+    @app.get("/test-entrade")
+async def test_entrade(
+    symbol: str = "ACB"
+):
+    import httpx
+
+    url = "https://services.entrade.com.vn/chart-api/v2/ohlcs/stock"
+
+    params = {
+        "from": "2026-08-01",
+        "to": "2026-09-24",
+        "symbol": symbol.upper(),
+        "resolution": "1D"
+    }
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        response = await client.get(url, params=params)
+
+    data = response.json()
+
+    return {
+        "status": response.status_code,
+        "source": "Entrade",
+        "symbol": symbol.upper(),
+        "success": response.is_success,
+        "data_points": len(data.get("t", []))
+    }
