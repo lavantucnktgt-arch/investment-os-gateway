@@ -233,20 +233,33 @@ async def breadth():
 async def groups():
     import httpx
 
-    symbols_url = "https://trading.vietcap.com.vn/api/price/symbols/getAll"
-    price_url = "https://trading.vietcap.com.vn/api/price/symbols/getList"
+    # ============================================================
+    # VCI ENDPOINTS
+    # ============================================================
+
+    symbols_url = (
+        "https://trading.vietcap.com.vn/api/price/symbols/getAll"
+    )
+
+    price_url = (
+        "https://trading.vietcap.com.vn/api/price/symbols/getList"
+    )
+
     industry_url = (
         "https://iq.vietcap.com.vn/"
-        "api/iq-insight-service/v2/company/search-bar?language=1"
+        "api/iq-insight-service/v1/sectors/icb-codes"
     )
 
     async with httpx.AsyncClient(timeout=60) as client:
 
-        # ============================================================
-        # 1. GET MARKET UNIVERSE
-        # ============================================================
+        # ========================================================
+        # 1. GET STOCK UNIVERSE
+        # ========================================================
 
-        universe_response = await client.get(symbols_url)
+        universe_response = await client.get(
+            symbols_url
+        )
+
         universe_response.raise_for_status()
 
         universe = universe_response.json()
@@ -254,112 +267,182 @@ async def groups():
         if isinstance(universe, dict):
             universe = universe.get("data", [])
 
-        stock_symbols = []
+        stocks = []
 
         for item in universe:
+
             if not isinstance(item, dict):
                 continue
 
-            if (
-                item.get("type") == "STOCK"
-                and item.get("board") in ["HSX", "HNX", "UPCOM"]
-            ):
-                symbol = item.get("symbol")
-
-                if symbol:
-                    stock_symbols.append(symbol)
-
-        stock_symbols = list(dict.fromkeys(stock_symbols))
-
-        # ============================================================
-        # 2. GET ICB INDUSTRY MAPPING FROM VCI
-        # ============================================================
-
-        industry_response = await client.get(industry_url)
-        industry_response.raise_for_status()
-
-        industry_payload = industry_response.json()
-
-        if isinstance(industry_payload, dict):
-            industry_data = industry_payload.get("data", [])
-        else:
-            industry_data = []
-
-        # symbol -> ICB level 2
-        symbol_industry = {}
-
-        # code -> industry name
-        industry_names = {}
-
-        for company in industry_data:
-
-            if not isinstance(company, dict):
+            if item.get("type") != "STOCK":
                 continue
 
-            symbol = company.get("code")
+            if item.get("board") not in [
+                "HSX",
+                "HNX",
+                "UPCOM"
+            ]:
+                continue
+
+            symbol = item.get("symbol")
 
             if not symbol:
                 continue
 
-            icb_level_2 = company.get("icbLv2")
+            icb_code = item.get("icbCode2")
 
-            if isinstance(icb_level_2, dict):
+            stocks.append({
+                "symbol": symbol,
+                "icb_code": str(icb_code)
+                if icb_code is not None
+                else None
+            })
 
-                icb_code = icb_level_2.get("code")
-                icb_name = icb_level_2.get("name")
+        # Remove duplicate symbols
 
-                if icb_code:
+        unique_stocks = {}
 
-                    symbol_industry[symbol] = icb_code
+        for item in stocks:
 
-                    if icb_name:
-                        industry_names[icb_code] = icb_name
+            symbol = item["symbol"]
 
-        # ============================================================
-        # 3. GET REALTIME PRICES IN BATCHES
-        # ============================================================
+            if symbol not in unique_stocks:
+                unique_stocks[symbol] = item
+
+        stocks = list(unique_stocks.values())
+
+        symbols = [
+            item["symbol"]
+            for item in stocks
+        ]
+
+        # ========================================================
+        # 2. GET ICB INDUSTRY NAMES
+        # ========================================================
+
+        industry_response = await client.get(
+            industry_url
+        )
+
+        industry_response.raise_for_status()
+
+        industry_payload = industry_response.json()
+
+        industry_data = []
+
+        if isinstance(industry_payload, dict):
+
+            industry_data = industry_payload.get(
+                "data",
+                []
+            )
+
+        # Map:
+        # ICB code -> Vietnamese industry name
+
+        industry_names = {}
+
+        for item in industry_data:
+
+            if not isinstance(item, dict):
+                continue
+
+            code = item.get("name")
+            name_vi = item.get("viSector")
+
+            if code is not None:
+
+                industry_names[str(code)] = (
+                    name_vi
+                    if name_vi
+                    else str(code)
+                )
+
+        # ========================================================
+        # 3. GET REALTIME PRICE BOARD
+        # ========================================================
 
         prices = []
 
         batch_size = 50
 
         total_batches = (
-            len(stock_symbols) + batch_size - 1
+            len(symbols) + batch_size - 1
         ) // batch_size
 
         successful_batches = 0
         failed_batches = 0
 
-        for i in range(0, len(stock_symbols), batch_size):
+        failed_batch_details = []
 
-            batch = stock_symbols[i:i + batch_size]
+        for i in range(
+            0,
+            len(symbols),
+            batch_size
+        ):
+
+            batch = symbols[
+                i:i + batch_size
+            ]
 
             try:
+
                 response = await client.post(
                     price_url,
-                    json={"symbols": batch}
+                    json={
+                        "symbols": batch
+                    }
                 )
 
                 if not response.is_success:
+
                     failed_batches += 1
+
+                    failed_batch_details.append({
+                        "batch_start": i,
+                        "status": response.status_code
+                    })
+
                     continue
 
                 data = response.json()
 
                 if isinstance(data, dict):
-                    data = data.get("data", [])
+                    data = data.get(
+                        "data",
+                        []
+                    )
 
                 if isinstance(data, list):
+
                     prices.extend(data)
 
                 successful_batches += 1
 
-            except Exception:
+            except Exception as exc:
+
                 failed_batches += 1
 
-        # ============================================================
-        # 4. CALCULATE GROUP BREADTH
-        # ============================================================
+                failed_batch_details.append({
+                    "batch_start": i,
+                    "error": str(exc)
+                })
+
+        # ========================================================
+        # 4. CREATE SYMBOL -> ICB MAP
+        # ========================================================
+
+        symbol_to_icb = {}
+
+        for item in stocks:
+
+            symbol_to_icb[
+                item["symbol"]
+            ] = item["icb_code"]
+
+        # ========================================================
+        # 5. CALCULATE GROUP BREADTH
+        # ========================================================
 
         groups_data = {}
 
@@ -370,54 +453,92 @@ async def groups():
             if not isinstance(item, dict):
                 continue
 
-            listing = item.get("listingInfo") or {}
-            match = item.get("matchPrice") or {}
+            listing = (
+                item.get("listingInfo")
+                or {}
+            )
 
-            symbol = listing.get("symbol")
+            match = (
+                item.get("matchPrice")
+                or {}
+            )
+
+            symbol = listing.get(
+                "symbol"
+            )
 
             if not symbol:
-                symbol = item.get("symbol")
+                symbol = item.get(
+                    "symbol"
+                )
 
             if not symbol:
                 continue
 
-            ref_price = listing.get("refPrice")
-            match_price = match.get("matchPrice")
+            ref_price = listing.get(
+                "refPrice"
+            )
 
-            if ref_price is None or match_price is None:
+            match_price = match.get(
+                "matchPrice"
+            )
+
+            if (
+                ref_price is None
+                or match_price is None
+            ):
                 continue
 
             try:
 
-                ref_price = float(ref_price)
-                match_price = float(match_price)
+                ref_price = float(
+                    ref_price
+                )
 
-            except (TypeError, ValueError):
+                match_price = float(
+                    match_price
+                )
+
+            except (
+                TypeError,
+                ValueError
+            ):
+
                 continue
 
-            if ref_price <= 0 or match_price <= 0:
+            if (
+                ref_price <= 0
+                or match_price <= 0
+            ):
                 continue
 
             priced_stocks += 1
 
             change_pct = (
-                (match_price - ref_price)
+                (
+                    match_price
+                    - ref_price
+                )
                 / ref_price
                 * 100
             )
 
             # ----------------------------------------
-            # Find industry
+            # Find ICB group
             # ----------------------------------------
 
-            icb_code = symbol_industry.get(symbol)
+            icb_code = symbol_to_icb.get(
+                symbol
+            )
 
             if not icb_code:
                 icb_code = "UNKNOWN"
 
-            industry_name = industry_names.get(
-                icb_code,
-                "Chưa xác định"
+            industry_name = (
+                industry_names.get(
+                    str(icb_code),
+                    "Chưa xác định"
+                )
             )
 
             # ----------------------------------------
@@ -436,14 +557,19 @@ async def groups():
                     "strong_advances_5pct": 0,
                     "strong_declines_5pct": 0,
                     "avg_change_pct": 0.0,
+                    "advance_ratio": 0.0,
                     "_change_sum": 0.0
                 }
 
-            group = groups_data[icb_code]
+            group = groups_data[
+                icb_code
+            ]
 
             group["total"] += 1
 
-            group["_change_sum"] += change_pct
+            group["_change_sum"] += (
+                change_pct
+            )
 
             # ----------------------------------------
             # Breadth
@@ -467,18 +593,21 @@ async def groups():
 
             if change_pct >= 5:
 
-                group["strong_advances_5pct"] += 1
+                group[
+                    "strong_advances_5pct"
+                ] += 1
 
             elif change_pct <= -5:
 
-                group["strong_declines_5pct"] += 1
+                group[
+                    "strong_declines_5pct"
+                ] += 1
 
-        # ============================================================
-        # 5. FINALIZE GROUP STATISTICS
-        # ============================================================
+        # ========================================================
+        # 6. FINALIZE GROUP STATISTICS
+        # ========================================================
 
         result = []
-
         for group in groups_data.values():
 
             total = group["total"]
@@ -486,12 +615,15 @@ async def groups():
             if total > 0:
 
                 group["avg_change_pct"] = round(
-                    group["_change_sum"] / total,
+                    group["_change_sum"]
+                    / total,
                     2
                 )
 
                 group["advance_ratio"] = round(
-                    group["advances"] / total * 100,
+                    group["advances"]
+                    / total
+                    * 100,
                     2
                 )
 
@@ -500,39 +632,56 @@ async def groups():
                 group["avg_change_pct"] = 0.0
                 group["advance_ratio"] = 0.0
 
-            # Remove internal calculation field
-
-            group.pop("_change_sum", None)
+            group.pop(
+                "_change_sum",
+                None
+            )
 
             result.append(group)
 
-        # ============================================================
-        # 6. SORT GROUPS
-        # ============================================================
+        # ========================================================
+        # 7. SORT GROUPS
+        # ========================================================
 
         result.sort(
-            key=lambda x: x["avg_change_pct"],
+            key=lambda x:
+                x["avg_change_pct"],
             reverse=True
         )
 
-        # ============================================================
-        # 7. RETURN DATA FOR INVESTMENT OS
-        # ============================================================
+        # ========================================================
+        # 8. RETURN
+
+        # ========================================================
 
         return {
+
             "source": "VCI",
 
-            "universe": len(stock_symbols),
+            "universe": len(symbols),
 
             "priced_stocks": priced_stocks,
 
             "total_batches": total_batches,
 
-            "successful_batches": successful_batches,
+            "successful_batches":
 
-            "failed_batches": failed_batches,
+                successful_batches,
 
-            "groups_count": len(result),
+            "failed_batches":
 
-            "groups": result
+                failed_batches,
+
+            "groups_count":
+
+                len(result),
+
+            "groups":
+
+                result,
+
+            "failed_batch_details":
+
+                failed_batch_details
+
         }
