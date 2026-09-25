@@ -66,70 +66,7 @@ async def market():
         "vnindex": vnindex,
         "vn30": vn30
     }
-@app.get("/breadth")
-async def breadth():
-    import httpx
-
-    symbols_url = "https://trading.vietcap.com.vn/api/price/symbols/getAll"
-    price_url = "https://trading.vietcap.com.vn/api/price/symbols/getList"
-
-    async with httpx.AsyncClient(timeout=30) as client:
-
-        # 1. Get market universe
-        universe_response = await client.get(symbols_url)
-        universe_response.raise_for_status()
-
-        universe = universe_response.json()
-
-        if isinstance(universe, dict):
-            universe = universe.get("data", [])
-
-        symbols = []
-
-        for item in universe:
-            if (
-                item.get("type") == "STOCK"
-                and item.get("board") in ["HSX", "HNX", "UPCOM"]
-            ):
-                symbol = item.get("symbol")
-
-                if symbol:
-                    symbols.append(symbol)
-
-        # Remove duplicates
-        symbols = list(dict.fromkeys(symbols))
-
-        # 2. Get realtime prices in batches
-        prices = []
-
-        batch_size = 50
-
-        for i in range(0, len(symbols), batch_size):
-
-            batch = symbols[i:i + batch_size]
-
-            response = await client.post(
-                price_url,
-                json={"symbols": batch}
-            )
-
-            if response.is_success:
-                data = response.json()
-
-                if isinstance(data, list):
-                    prices.extend(data)
-
-        # 3. Calculate breadth
-        advances = 0
-        declines = 0
-        unchanged = 0
-
-        strong_advances = 0
-        strong_declines = 0
-
-        priced_stocks = 0
-
-        for item in prices:
+for item in prices:
 
             listing = item.get("listingInfo") or {}
             match = item.get("matchPrice") or {}
@@ -143,6 +80,7 @@ async def breadth():
             try:
                 ref_price = float(ref_price)
                 match_price = float(match_price)
+
             except (TypeError, ValueError):
                 continue
 
@@ -172,14 +110,31 @@ async def breadth():
             elif change_pct <= -5:
                 strong_declines += 1
 
-        # 4. Return clean data for Investment OS
+        # 4. Return diagnostic + breadth data
         return {
             "source": "VCI",
+
             "universe": len(symbols),
+
+            "total_batches": total_batches,
+
+            "successful_batches": successful_batches,
+
+            "failed_batches": failed_batches,
+
+            "symbols_received": len(prices),
+
             "priced_stocks": priced_stocks,
+
             "advances": advances,
+
             "declines": declines,
+
             "unchanged": unchanged,
+
             "strong_advances_5pct": strong_advances,
-            "strong_declines_5pct": strong_declines
+
+            "strong_declines_5pct": strong_declines,
+
+            "failed_batch_details": failed_batch_details
         }
