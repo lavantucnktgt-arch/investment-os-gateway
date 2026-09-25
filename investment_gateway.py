@@ -66,13 +66,104 @@ async def market():
         "vnindex": vnindex,
         "vn30": vn30
     }
-for item in prices:
+@app.get("/breadth")
+async def breadth():
+    import httpx
 
+    symbols_url = "https://trading.vietcap.com.vn/api/price/symbols/getAll"
+    price_url = "https://trading.vietcap.com.vn/api/price/symbols/getList"
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        universe_response = await client.get(symbols_url)
+        universe_response.raise_for_status()
+
+        universe = universe_response.json()
+
+        if isinstance(universe, dict):
+            universe = universe.get("data", [])
+
+        symbols = []
+
+        for item in universe:
+            if (
+                item.get("type") == "STOCK"
+                and item.get("board") in ["HSX", "HNX", "UPCOM"]
+            ):
+                symbol = item.get("symbol")
+
+                if symbol:
+                    symbols.append(symbol)
+
+        symbols = list(dict.fromkeys(symbols))
+
+        prices = []
+
+        batch_size = 20
+        total_batches = (len(symbols) + batch_size - 1) // batch_size
+
+        successful_batches = 0
+        failed_batches = 0
+        failed_batch_details = []
+
+        for batch_number, i in enumerate(
+            range(0, len(symbols), batch_size),
+            start=1
+        ):
+            batch = symbols[i:i + batch_size]
+
+            try:
+                response = await client.post(
+                    price_url,
+                    json={"symbols": batch}
+                )
+
+                if response.is_success:
+                    data = response.json()
+
+                    if isinstance(data, list):
+                        prices.extend(data)
+                        successful_batches += 1
+                    else:
+                        failed_batches += 1
+                        failed_batch_details.append({
+                            "batch": batch_number,
+                            "reason": "Response is not a list",
+                            "http_status": response.status_code,
+                            "symbols": len(batch)
+                        })
+                else:
+                    failed_batches += 1
+                    failed_batch_details.append({
+                        "batch": batch_number,
+                        "reason": "HTTP error",
+                        "http_status": response.status_code,
+                        "symbols": len(batch)
+                    })
+
+            except Exception as e:
+                failed_batches += 1
+                failed_batch_details.append({
+                    "batch": batch_number,
+                    "reason": str(e),
+                    "http_status": None,
+                    "symbols": len(batch)
+                })
+
+        advances = 0
+        declines = 0
+        unchanged = 0
+
+        strong_advances = 0
+        strong_declines = 0
+
+        priced_stocks = 0
+
+        for item in prices:
             listing = item.get("listingInfo") or {}
             match = item.get("matchPrice") or {}
 
             ref_price = listing.get("refPrice")
-            match_price = match.get("matchPrice")
+match_price = match.get("matchPrice")
 
             if ref_price is None or match_price is None:
                 continue
@@ -80,7 +171,6 @@ for item in prices:
             try:
                 ref_price = float(ref_price)
                 match_price = float(match_price)
-
             except (TypeError, ValueError):
                 continue
 
@@ -97,44 +187,28 @@ for item in prices:
 
             if change_pct > 0:
                 advances += 1
-
             elif change_pct < 0:
                 declines += 1
-
             else:
                 unchanged += 1
 
             if change_pct >= 5:
                 strong_advances += 1
-
             elif change_pct <= -5:
                 strong_declines += 1
 
-        # 4. Return diagnostic + breadth data
         return {
             "source": "VCI",
-
             "universe": len(symbols),
-
             "total_batches": total_batches,
-
             "successful_batches": successful_batches,
-
             "failed_batches": failed_batches,
-
             "symbols_received": len(prices),
-
             "priced_stocks": priced_stocks,
-
             "advances": advances,
-
             "declines": declines,
-
             "unchanged": unchanged,
-
             "strong_advances_5pct": strong_advances,
-
             "strong_declines_5pct": strong_declines,
-
             "failed_batch_details": failed_batch_details
         }
