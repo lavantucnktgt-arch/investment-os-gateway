@@ -341,31 +341,31 @@ industry_data = []
 
 if isinstance(industry_payload, dict):
 
-            industry_data = industry_payload.get(
-                "data",
-                []
-            )
+    industry_data = industry_payload.get(
+        "data",
+        []
+    )
 
-        # Map:
-        # ICB code -> Vietnamese industry name
+# Map:
+# ICB code -> Vietnamese industry name
 
-        industry_names = {}
+industry_names = {}
 
-        for item in industry_data:
+for item in industry_data:
 
-            if not isinstance(item, dict):
-                continue
+    if not isinstance(item, dict):
+        continue
 
-            code = item.get("name")
-            name_vi = item.get("viSector")
+    code = item.get("name")
+    name_vi = item.get("viSector")
 
-            if code is not None:
+    if code is not None:
 
-                industry_names[str(code)] = (
-                    name_vi
-                    if name_vi
-                    else str(code)
-                )
+        industry_names[str(code)] = (
+            name_vi
+            if name_vi
+            else str(code)
+        )
 
         # ========================================================
         # 3. GET REALTIME PRICE BOARD
