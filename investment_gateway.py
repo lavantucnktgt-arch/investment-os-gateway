@@ -66,32 +66,120 @@ async def market():
         "vnindex": vnindex,
         "vn30": vn30
     }
-@app.get("/test-vci-board")
-async def test_vci_board():
+@app.get("/breadth")
+async def breadth():
     import httpx
 
-    url = "https://trading.vietcap.com.vn/api/price/symbols/getList"
+    symbols_url = "https://trading.vietcap.com.vn/api/price/symbols/getAll"
+    price_url = "https://trading.vietcap.com.vn/api/price/symbols/getList"
 
-    payload = {
-        "symbols": ["VCI", "VCB", "ACB"]
-    }
+    async with httpx.AsyncClient(timeout=30) as client:
 
-    async with httpx.AsyncClient(timeout=20) as client:
-        response = await client.post(
-            url,
-            json=payload
-        )
+        # 1. Get market universe
+        universe_response = await client.get(symbols_url)
+        universe_response.raise_for_status()
 
-    return {
-        "status": response.status_code,
-        "source": "VCI",
-        "success": response.is_success,
-        "data": response.json()
-    }
+        universe = universe_response.json()
 
-    return {
-        "status": response.status_code,
-        "source": "VCI",
-        "success": response.is_success,
-        "data": response.json()
-    }
+        if isinstance(universe, dict):
+            universe = universe.get("data", [])
+
+        symbols = []
+
+        for item in universe:
+            if (
+                item.get("type") == "STOCK"
+                and item.get("board") in ["HSX", "HNX", "UPCOM"]
+            ):
+                symbol = item.get("symbol")
+
+                if symbol:
+                    symbols.append(symbol)
+
+        # Remove duplicates
+        symbols = list(dict.fromkeys(symbols))
+
+        # 2. Get realtime prices in batches
+        prices = []
+
+        batch_size = 50
+
+        for i in range(0, len(symbols), batch_size):
+
+            batch = symbols[i:i + batch_size]
+
+            response = await client.post(
+                price_url,
+                json={"symbols": batch}
+            )
+
+            if response.is_success:
+                data = response.json()
+
+                if isinstance(data, list):
+                    prices.extend(data)
+
+        # 3. Calculate breadth
+        advances = 0
+        declines = 0
+        unchanged = 0
+
+        strong_advances = 0
+        strong_declines = 0
+
+        priced_stocks = 0
+
+        for item in prices:
+
+            listing = item.get("listingInfo") or {}
+            match = item.get("matchPrice") or {}
+
+            ref_price = listing.get("refPrice")
+            match_price = match.get("matchPrice")
+
+            if ref_price is None or match_price is None:
+                continue
+
+            try:
+                ref_price = float(ref_price)
+                match_price = float(match_price)
+            except (TypeError, ValueError):
+                continue
+
+            if ref_price <= 0 or match_price <= 0:
+                continue
+
+            priced_stocks += 1
+
+            change_pct = (
+                (match_price - ref_price)
+                / ref_price
+                * 100
+            )
+
+            if change_pct > 0:
+                advances += 1
+
+            elif change_pct < 0:
+                declines += 1
+
+            else:
+                unchanged += 1
+
+            if change_pct >= 5:
+                strong_advances += 1
+
+            elif change_pct <= -5:
+                strong_declines += 1
+
+        # 4. Return clean data for Investment OS
+        return {
+            "source": "VCI",
+            "universe": len(symbols),
+            "priced_stocks": priced_stocks,
+            "advances": advances,
+            "declines": declines,
+            "unchanged": unchanged,
+            "strong_advances_5pct": strong_advances,
+            "strong_declines_5pct": strong_declines
+        }
