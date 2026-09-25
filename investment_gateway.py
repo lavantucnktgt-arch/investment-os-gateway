@@ -66,7 +66,7 @@ async def market():
         "vnindex": vnindex,
         "vn30": vn30
     }
-   @app.get("/test-vci-board")
+@app.get("/test-vci-board")
 async def test_vci_board():
     import httpx
 
@@ -81,6 +81,13 @@ async def test_vci_board():
             url,
             json=payload
         )
+
+    return {
+        "status": response.status_code,
+        "source": "VCI",
+        "success": response.is_success,
+        "data": response.json()
+    }
 
     return {
         "status": response.status_code,
