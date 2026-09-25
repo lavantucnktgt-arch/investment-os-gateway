@@ -74,6 +74,8 @@ async def breadth():
     price_url = "https://trading.vietcap.com.vn/api/price/symbols/getList"
 
     async with httpx.AsyncClient(timeout=30) as client:
+
+        # 1. Get full market universe
         universe_response = await client.get(symbols_url)
         universe_response.raise_for_status()
 
@@ -82,34 +84,43 @@ async def breadth():
         if isinstance(universe, dict):
             universe = universe.get("data", [])
 
+        if not isinstance(universe, list):
+            universe = []
+
         symbols = []
 
         for item in universe:
-            if (
-                item.get("type") == "STOCK"
-                and item.get("board") in ["HSX", "HNX", "UPCOM"]
-            ):
-                symbol = item.get("symbol")
+            if not isinstance(item, dict):
+                continue
 
-                if symbol:
-                    symbols.append(symbol)
+            if item.get("type") != "STOCK":
+                continue
 
+            if item.get("board") not in ["HSX", "HNX", "UPCOM"]:
+                continue
+
+            symbol = item.get("symbol")
+
+            if symbol:
+                symbols.append(symbol)
+
+        # Remove duplicate symbols
         symbols = list(dict.fromkeys(symbols))
 
+        # 2. Get realtime prices in batches
         prices = []
 
-        batch_size = 20
-        total_batches = (len(symbols) + batch_size - 1) // batch_size
+        batch_size = 50
 
+        total_batches = 0
         successful_batches = 0
         failed_batches = 0
         failed_batch_details = []
 
-        for batch_number, i in enumerate(
-            range(0, len(symbols), batch_size),
-            start=1
-        ):
+        for i in range(0, len(symbols), batch_size):
+
             batch = symbols[i:i + batch_size]
+            total_batches += 1
 
             try:
                 response = await client.post(
@@ -117,38 +128,36 @@ async def breadth():
                     json={"symbols": batch}
                 )
 
-                if response.is_success:
-                    data = response.json()
-
-                    if isinstance(data, list):
-                        prices.extend(data)
-                        successful_batches += 1
-                    else:
-                        failed_batches += 1
-                        failed_batch_details.append({
-                            "batch": batch_number,
-                            "reason": "Response is not a list",
-                            "http_status": response.status_code,
-                            "symbols": len(batch)
-                        })
-                else:
+                if not response.is_success:
                     failed_batches += 1
+
                     failed_batch_details.append({
-                        "batch": batch_number,
-                        "reason": "HTTP error",
-                        "http_status": response.status_code,
-                        "symbols": len(batch)
+                        "batch": total_batches,
+                        "status": response.status_code
                     })
 
-            except Exception as e:
+                    continue
+
+                data = response.json()
+
+                if isinstance(data, dict):
+                    data = data.get("data", [])
+
+                if not isinstance(data, list):
+                    data = []
+
+                prices.extend(data)
+                successful_batches += 1
+
+            except Exception as exc:
                 failed_batches += 1
+
                 failed_batch_details.append({
-                    "batch": batch_number,
-                    "reason": str(e),
-                    "http_status": None,
-                    "symbols": len(batch)
+                    "batch": total_batches,
+                    "error": str(exc)
                 })
 
+        # 3. Calculate market breadth
         advances = 0
         declines = 0
         unchanged = 0
@@ -159,11 +168,15 @@ async def breadth():
         priced_stocks = 0
 
         for item in prices:
+
+            if not isinstance(item, dict):
+                continue
+
             listing = item.get("listingInfo") or {}
             match = item.get("matchPrice") or {}
 
             ref_price = listing.get("refPrice")
-match_price = match.get("matchPrice")
+            match_price = match.get("matchPrice")
 
             if ref_price is None or match_price is None:
                 continue
@@ -187,16 +200,20 @@ match_price = match.get("matchPrice")
 
             if change_pct > 0:
                 advances += 1
+
             elif change_pct < 0:
                 declines += 1
+
             else:
                 unchanged += 1
 
             if change_pct >= 5:
                 strong_advances += 1
+
             elif change_pct <= -5:
                 strong_declines += 1
 
+        # 4. Return clean data for Investment OS
         return {
             "source": "VCI",
             "universe": len(symbols),
