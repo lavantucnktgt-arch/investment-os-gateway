@@ -66,4 +66,25 @@ async def market():
         "vnindex": vnindex,
         "vn30": vn30
     }
-   
+   @app.get("/test-vci-board")
+async def test_vci_board():
+    import httpx
+
+    url = "https://trading.vietcap.com.vn/api/price/symbols/getList"
+
+    payload = {
+        "symbols": ["VCI", "VCB", "ACB"]
+    }
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        response = await client.post(
+            url,
+            json=payload
+        )
+
+    return {
+        "status": response.status_code,
+        "source": "VCI",
+        "success": response.is_success,
+        "data": response.json()
+    }
