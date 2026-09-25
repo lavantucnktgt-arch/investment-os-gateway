@@ -321,376 +321,376 @@ async def groups():
         # ========================================================
 
         industry_headers = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Referer": "https://trading.vietcap.com.vn/",
-    "Origin": "https://trading.vietcap.com.vn",
-}
-
-industry_response = await client.get(
-    industry_url,
-    headers=industry_headers
-)
-
-industry_response.raise_for_status()
-
-industry_payload = industry_response.json()
-
-industry_data = []
-
-if isinstance(industry_payload, dict):
-
-    industry_data = industry_payload.get(
-        "data",
-        []
-    )
-
-# Map:
-# ICB code -> Vietnamese industry name
-
-industry_names = {}
-
-for item in industry_data:
-
-    if not isinstance(item, dict):
-        continue
-
-    code = item.get("name")
-    name_vi = item.get("viSector")
-
-    if code is not None:
-
-        industry_names[str(code)] = (
-            name_vi
-            if name_vi
-            else str(code)
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": "https://trading.vietcap.com.vn/",
+        "Origin": "https://trading.vietcap.com.vn",
+    }
+    
+        industry_response = await client.get(
+            industry_url,
+            headers=industry_headers
         )
-
-        # ========================================================
-        # 3. GET REALTIME PRICE BOARD
-        # ========================================================
-
-        prices = []
-
-        batch_size = 50
-
-        total_batches = (
-            len(symbols) + batch_size - 1
-        ) // batch_size
-
-        successful_batches = 0
-        failed_batches = 0
-
-        failed_batch_details = []
-
-        for i in range(
-            0,
-            len(symbols),
-            batch_size
-        ):
-
-            batch = symbols[
-                i:i + batch_size
-            ]
-
-            try:
-
-                response = await client.post(
-                    price_url,
-                    json={
-                        "symbols": batch
-                    }
-                )
-
-                if not response.is_success:
-
+    
+        industry_response.raise_for_status()
+    
+        industry_payload = industry_response.json()
+    
+        industry_data = []
+    
+    if isinstance(industry_payload, dict):
+    
+        industry_data = industry_payload.get(
+            "data",
+            []
+        )
+    
+    # Map:
+    # ICB code -> Vietnamese industry name
+    
+    industry_names = {}
+    
+    for item in industry_data:
+    
+        if not isinstance(item, dict):
+            continue
+    
+        code = item.get("name")
+        name_vi = item.get("viSector")
+    
+        if code is not None:
+    
+            industry_names[str(code)] = (
+                name_vi
+                if name_vi
+                else str(code)
+            )
+    
+            # ========================================================
+            # 3. GET REALTIME PRICE BOARD
+            # ========================================================
+    
+            prices = []
+    
+            batch_size = 50
+    
+            total_batches = (
+                len(symbols) + batch_size - 1
+            ) // batch_size
+    
+            successful_batches = 0
+            failed_batches = 0
+    
+            failed_batch_details = []
+    
+            for i in range(
+                0,
+                len(symbols),
+                batch_size
+            ):
+    
+                batch = symbols[
+                    i:i + batch_size
+                ]
+    
+                try:
+    
+                    response = await client.post(
+                        price_url,
+                        json={
+                            "symbols": batch
+                        }
+                    )
+    
+                    if not response.is_success:
+    
+                        failed_batches += 1
+    
+                        failed_batch_details.append({
+                            "batch_start": i,
+                            "status": response.status_code
+                        })
+    
+                        continue
+    
+                    data = response.json()
+    
+                    if isinstance(data, dict):
+                        data = data.get(
+                            "data",
+                            []
+                        )
+    
+                    if isinstance(data, list):
+    
+                        prices.extend(data)
+    
+                    successful_batches += 1
+    
+                except Exception as exc:
+    
                     failed_batches += 1
-
+    
                     failed_batch_details.append({
                         "batch_start": i,
-                        "status": response.status_code
+                        "error": str(exc)
                     })
-
+    
+            # ========================================================
+            # 4. CREATE SYMBOL -> ICB MAP
+            # ========================================================
+    
+            symbol_to_icb = {}
+    
+            for item in stocks:
+    
+                symbol_to_icb[
+                    item["symbol"]
+                ] = item["icb_code"]
+    
+            # ========================================================
+            # 5. CALCULATE GROUP BREADTH
+            # ========================================================
+    
+            groups_data = {}
+    
+            priced_stocks = 0
+    
+            for item in prices:
+    
+                if not isinstance(item, dict):
                     continue
-
-                data = response.json()
-
-                if isinstance(data, dict):
-                    data = data.get(
-                        "data",
-                        []
-                    )
-
-                if isinstance(data, list):
-
-                    prices.extend(data)
-
-                successful_batches += 1
-
-            except Exception as exc:
-
-                failed_batches += 1
-
-                failed_batch_details.append({
-                    "batch_start": i,
-                    "error": str(exc)
-                })
-
-        # ========================================================
-        # 4. CREATE SYMBOL -> ICB MAP
-        # ========================================================
-
-        symbol_to_icb = {}
-
-        for item in stocks:
-
-            symbol_to_icb[
-                item["symbol"]
-            ] = item["icb_code"]
-
-        # ========================================================
-        # 5. CALCULATE GROUP BREADTH
-        # ========================================================
-
-        groups_data = {}
-
-        priced_stocks = 0
-
-        for item in prices:
-
-            if not isinstance(item, dict):
-                continue
-
-            listing = (
-                item.get("listingInfo")
-                or {}
-            )
-
-            match = (
-                item.get("matchPrice")
-                or {}
-            )
-
-            symbol = listing.get(
-                "symbol"
-            )
-
-            if not symbol:
-                symbol = item.get(
+    
+                listing = (
+                    item.get("listingInfo")
+                    or {}
+                )
+    
+                match = (
+                    item.get("matchPrice")
+                    or {}
+                )
+    
+                symbol = listing.get(
                     "symbol"
                 )
-
-            if not symbol:
-                continue
-
-            ref_price = listing.get(
-                "refPrice"
-            )
-
-            match_price = match.get(
-                "matchPrice"
-            )
-
-            if (
-                ref_price is None
-                or match_price is None
-            ):
-                continue
-
-            try:
-
-                ref_price = float(
-                    ref_price
+    
+                if not symbol:
+                    symbol = item.get(
+                        "symbol"
+                    )
+    
+                if not symbol:
+                    continue
+    
+                ref_price = listing.get(
+                    "refPrice"
                 )
-
-                match_price = float(
-                    match_price
+    
+                match_price = match.get(
+                    "matchPrice"
                 )
-
-            except (
-                TypeError,
-                ValueError
-            ):
-
-                continue
-
-            if (
-                ref_price <= 0
-                or match_price <= 0
-            ):
-                continue
-
-            priced_stocks += 1
-
-            change_pct = (
-                (
-                    match_price
-                    - ref_price
+    
+                if (
+                    ref_price is None
+                    or match_price is None
+                ):
+                    continue
+    
+                try:
+    
+                    ref_price = float(
+                        ref_price
+                    )
+    
+                    match_price = float(
+                        match_price
+                    )
+    
+                except (
+                    TypeError,
+                    ValueError
+                ):
+    
+                    continue
+    
+                if (
+                    ref_price <= 0
+                    or match_price <= 0
+                ):
+                    continue
+    
+                priced_stocks += 1
+    
+                change_pct = (
+                    (
+                        match_price
+                        - ref_price
+                    )
+                    / ref_price
+                    * 100
                 )
-                / ref_price
-                * 100
-            )
-
-            # ----------------------------------------
-            # Find ICB group
-            # ----------------------------------------
-
-            icb_code = symbol_to_icb.get(
-                symbol
-            )
-
-            if not icb_code:
-                icb_code = "UNKNOWN"
-
-            industry_name = (
-                industry_names.get(
-                    str(icb_code),
-                    "Chưa xác định"
+    
+                # ----------------------------------------
+                # Find ICB group
+                # ----------------------------------------
+    
+                icb_code = symbol_to_icb.get(
+                    symbol
                 )
-            )
-
-            # ----------------------------------------
-            # Create group
-            # ----------------------------------------
-
-            if icb_code not in groups_data:
-
-                groups_data[icb_code] = {
-                    "icb_code": icb_code,
-                    "industry": industry_name,
-                    "total": 0,
-                    "advances": 0,
-                    "declines": 0,
-                    "unchanged": 0,
-                    "strong_advances_5pct": 0,
-                    "strong_declines_5pct": 0,
-                    "avg_change_pct": 0.0,
-                    "advance_ratio": 0.0,
-                    "_change_sum": 0.0
-                }
-
-            group = groups_data[
-                icb_code
-            ]
-
-            group["total"] += 1
-
-            group["_change_sum"] += (
-                change_pct
-            )
-
-            # ----------------------------------------
-            # Breadth
-            # ----------------------------------------
-
-            if change_pct > 0:
-
-                group["advances"] += 1
-
-            elif change_pct < 0:
-
-                group["declines"] += 1
-
-            else:
-
-                group["unchanged"] += 1
-
-            # ----------------------------------------
-            # Strong movers
-            # ----------------------------------------
-
-            if change_pct >= 5:
-
-                group[
-                    "strong_advances_5pct"
-                ] += 1
-
-            elif change_pct <= -5:
-
-                group[
-                    "strong_declines_5pct"
-                ] += 1
-
-        # ========================================================
-        # 6. FINALIZE GROUP STATISTICS
-        # ========================================================
-
-        result = []
-        for group in groups_data.values():
-
-            total = group["total"]
-
-            if total > 0:
-
-                group["avg_change_pct"] = round(
-                    group["_change_sum"]
-                    / total,
-                    2
+    
+                if not icb_code:
+                    icb_code = "UNKNOWN"
+    
+                industry_name = (
+                    industry_names.get(
+                        str(icb_code),
+                        "Chưa xác định"
+                    )
                 )
-
-                group["advance_ratio"] = round(
-                    group["advances"]
-                    / total
-                    * 100,
-                    2
+    
+                # ----------------------------------------
+                # Create group
+                # ----------------------------------------
+    
+                if icb_code not in groups_data:
+    
+                    groups_data[icb_code] = {
+                        "icb_code": icb_code,
+                        "industry": industry_name,
+                        "total": 0,
+                        "advances": 0,
+                        "declines": 0,
+                        "unchanged": 0,
+                        "strong_advances_5pct": 0,
+                        "strong_declines_5pct": 0,
+                        "avg_change_pct": 0.0,
+                        "advance_ratio": 0.0,
+                        "_change_sum": 0.0
+                    }
+    
+                group = groups_data[
+                    icb_code
+                ]
+    
+                group["total"] += 1
+    
+                group["_change_sum"] += (
+                    change_pct
                 )
-
-            else:
-
-                group["avg_change_pct"] = 0.0
-                group["advance_ratio"] = 0.0
-
-            group.pop(
-                "_change_sum",
-                None
+    
+                # ----------------------------------------
+                # Breadth
+                # ----------------------------------------
+    
+                if change_pct > 0:
+    
+                    group["advances"] += 1
+    
+                elif change_pct < 0:
+    
+                    group["declines"] += 1
+    
+                else:
+    
+                    group["unchanged"] += 1
+    
+                # ----------------------------------------
+                # Strong movers
+                # ----------------------------------------
+    
+                if change_pct >= 5:
+    
+                    group[
+                        "strong_advances_5pct"
+                    ] += 1
+    
+                elif change_pct <= -5:
+    
+                    group[
+                        "strong_declines_5pct"
+                    ] += 1
+    
+            # ========================================================
+            # 6. FINALIZE GROUP STATISTICS
+            # ========================================================
+    
+            result = []
+            for group in groups_data.values():
+    
+                total = group["total"]
+    
+                if total > 0:
+    
+                    group["avg_change_pct"] = round(
+                        group["_change_sum"]
+                        / total,
+                        2
+                    )
+    
+                    group["advance_ratio"] = round(
+                        group["advances"]
+                        / total
+                        * 100,
+                        2
+                    )
+    
+                else:
+    
+                    group["avg_change_pct"] = 0.0
+                    group["advance_ratio"] = 0.0
+    
+                group.pop(
+                    "_change_sum",
+                    None
+                )
+    
+                result.append(group)
+    
+            # ========================================================
+            # 7. SORT GROUPS
+            # ========================================================
+    
+            result.sort(
+                key=lambda x:
+                    x["avg_change_pct"],
+                reverse=True
             )
-
-            result.append(group)
-
-        # ========================================================
-        # 7. SORT GROUPS
-        # ========================================================
-
-        result.sort(
-            key=lambda x:
-                x["avg_change_pct"],
-            reverse=True
-        )
-
-        # ========================================================
-        # 8. RETURN
-
-        # ========================================================
-
-        return {
-
-            "source": "VCI",
-
-            "universe": len(symbols),
-
-            "priced_stocks": priced_stocks,
-
-            "total_batches": total_batches,
-
-            "successful_batches":
-
-                successful_batches,
-
-            "failed_batches":
-
-                failed_batches,
-
-            "groups_count":
-
-                len(result),
-
-            "groups":
-
-                result,
-
-            "failed_batch_details":
-
-                failed_batch_details
-
-        }
+    
+            # ========================================================
+            # 8. RETURN
+    
+            # ========================================================
+    
+            return {
+    
+                "source": "VCI",
+    
+                "universe": len(symbols),
+    
+                "priced_stocks": priced_stocks,
+    
+                "total_batches": total_batches,
+    
+                "successful_batches":
+    
+                    successful_batches,
+    
+                "failed_batches":
+    
+                    failed_batches,
+    
+                "groups_count":
+    
+                    len(result),
+    
+                "groups":
+    
+                    result,
+    
+                "failed_batch_details":
+    
+                    failed_batch_details
+    
+            }
