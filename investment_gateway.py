@@ -335,11 +335,11 @@ industry_response = await client.get(
 
 industry_response.raise_for_status()
 
-        industry_payload = industry_response.json()
+industry_payload = industry_response.json()
 
-        industry_data = []
+industry_data = []
 
-        if isinstance(industry_payload, dict):
+if isinstance(industry_payload, dict):
 
             industry_data = industry_payload.get(
                 "data",
