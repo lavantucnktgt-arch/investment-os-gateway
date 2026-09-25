@@ -320,11 +320,20 @@ async def groups():
         # 2. GET ICB INDUSTRY NAMES
         # ========================================================
 
-        industry_response = await client.get(
-            industry_url
-        )
+        industry_headers = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Referer": "https://trading.vietcap.com.vn/",
+    "Origin": "https://trading.vietcap.com.vn",
+}
 
-        industry_response.raise_for_status()
+industry_response = await client.get(
+    industry_url,
+    headers=industry_headers
+)
+
+industry_response.raise_for_status()
 
         industry_payload = industry_response.json()
 
