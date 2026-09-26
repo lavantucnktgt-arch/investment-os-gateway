@@ -714,3 +714,181 @@ async def groups():
                     failed_batch_details
     
             }
+            # ============================================================
+# LEADER V1
+# ============================================================
+
+@app.get("/leaders")
+async def leaders():
+    symbols_url = (
+        "https://trading.vietcap.com.vn/api/price/symbols/getAll"
+    )
+
+    price_url = (
+        "https://trading.vietcap.com.vn/api/price/symbols/getList"
+    )
+
+    async with httpx.AsyncClient(timeout=60) as client:
+
+        # 1. GET STOCK UNIVERSE
+        universe_response = await client.get(symbols_url)
+        universe_response.raise_for_status()
+
+        universe = universe_response.json()
+
+        if isinstance(universe, dict):
+            universe = universe.get("data", [])
+
+        symbols = []
+
+        for item in universe:
+            if not isinstance(item, dict):
+                continue
+
+            if item.get("type") != "STOCK":
+                continue
+
+            if item.get("board") not in ["HSX", "HNX", "UPCOM"]:
+                continue
+
+            symbol = item.get("symbol")
+
+            if symbol:
+                symbols.append(symbol)
+
+        symbols = list(dict.fromkeys(symbols))
+
+        # 2. GET REALTIME PRICE IN BATCHES
+        prices = []
+        batch_size = 50
+
+        for i in range(0, len(symbols), batch_size):
+
+            batch = symbols[i:i + batch_size]
+
+            try:
+                response = await client.post(
+                    price_url,
+                    json={"symbols": batch}
+                )
+
+                if not response.is_success:
+                    continue
+
+                data = response.json()
+
+                if isinstance(data, dict):
+                    data = data.get("data", [])
+
+                if isinstance(data, list):
+                    prices.extend(data)
+
+            except Exception:
+                continue
+
+        # 3. CALCULATE PRICE CHANGE + LIQUIDITY
+        stocks = []
+
+        for item in prices:
+
+            if not isinstance(item, dict):
+                continue
+
+            listing = item.get("listingInfo") or {}
+            match = item.get("matchPrice") or {}
+
+            symbol = listing.get("symbol")
+
+            ref_price = listing.get("refPrice")
+            match_price = match.get("matchPrice")
+            total_volume = match.get("totalVolume")
+
+            if not symbol:
+                continue
+
+            try:
+                ref_price = float(ref_price)
+                match_price = float(match_price)
+                total_volume = float(total_volume or 0)
+            except (TypeError, ValueError):
+                continue
+
+            if ref_price <= 0 or match_price <= 0:
+                continue
+
+            change_pct = (
+                (match_price - ref_price)
+                / ref_price
+                * 100
+            )
+
+            liquidity_value = (
+                match_price * total_volume
+            )
+
+            stocks.append({
+                "symbol": symbol,
+                "price": match_price,
+                "ref_price": ref_price,
+                "change_pct": round(change_pct, 2),
+                "volume": int(total_volume),
+                "liquidity_value": round(
+                    liquidity_value / 1_000_000_000,
+                    2
+                )
+            })
+
+        # 4. TOP GAINERS
+        top_gainers = sorted(
+            stocks,
+            key=lambda x: x["change_pct"],
+            reverse=True
+        )[:20]
+
+        # 5. TOP LIQUIDITY
+        top_liquidity = sorted(
+            stocks,
+            key=lambda x: x["liquidity_value"],
+            reverse=True
+        )[:20]
+
+        # 6. LEADER CANDIDATES
+        gainers_symbols = {
+            x["symbol"]
+            for x in top_gainers[:30]
+        }
+
+        liquidity_symbols = {
+            x["symbol"]
+            for x in top_liquidity[:30]
+        }
+
+        leader_symbols = (
+            gainers_symbols
+            & liquidity_symbols
+        )
+
+        leader_candidates = [
+            x for x in stocks
+            if x["symbol"] in leader_symbols
+        ]
+
+        leader_candidates = sorted(
+            leader_candidates,
+            key=lambda x: (
+                x["change_pct"],
+                x["liquidity_value"]
+            ),
+            reverse=True
+        )
+
+        # 7. RETURN
+        return {
+            "source": "VCI",
+            "universe": len(symbols),
+            "priced_stocks": len(stocks),
+            "top_gainers": top_gainers,
+            "top_liquidity": top_liquidity,
+            "leader_candidates": leader_candidates
+        }
+            
