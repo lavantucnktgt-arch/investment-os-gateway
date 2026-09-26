@@ -110,51 +110,71 @@ async def breadth():
         # 2. Get realtime prices in batches
         prices = []
 
-        batch_size = 50
+batch_size = 50
 
-        total_batches = 0
-        successful_batches = 0
-        failed_batches = 0
-        failed_batch_details = []
+total_batches = (
+    len(symbols) + batch_size - 1
+) // batch_size
 
-        for i in range(0, len(symbols), batch_size):
+successful_batches = 0
+failed_batches = 0
 
-            batch = symbols[i:i + batch_size]
-            total_batches += 1
+failed_batch_details = []
 
-            try:
-                response = await client.post(
-                    price_url,
-                    json={"symbols": batch}
-                )
+async with httpx.AsyncClient(timeout=60) as price_client:
 
-                if not response.is_success:
-                    failed_batches += 1
+    for i in range(
+        0,
+        len(symbols),
+        batch_size
+    ):
 
-                    failed_batch_details.append({
-                        "batch": total_batches,
-                        "status": response.status_code
-                    })
+        batch = symbols[
+            i:i + batch_size
+        ]
 
-                    continue
+        try:
 
-                data = response.json()
+            response = await price_client.post(
+                price_url,
+                json={
+                    "symbols": batch
+                }
+            )
 
-                if isinstance(data, dict):
-                    data = data.get("data", [])
+            if not response.is_success:
 
-                if not isinstance(data, list):
-                    data = []
-
-                prices.extend(data)
-                successful_batches += 1
-
-            except Exception as exc:
                 failed_batches += 1
 
                 failed_batch_details.append({
-                    "batch": total_batches,
-                    "error": str(exc)
+                    "batch_start": i,
+                    "status": response.status_code
+                })
+
+                continue
+
+            data = response.json()
+
+            if isinstance(data, dict):
+                data = data.get(
+                    "data",
+                    []
+                )
+
+            if isinstance(data, list):
+
+                prices.extend(data)
+
+                successful_batches += 1
+
+        except Exception as exc:
+
+            failed_batches += 1
+
+            failed_batch_details.append({
+                "batch_start": i,
+                "error": str(exc)
+            })
                 })
 
         # 3. Calculate market breadth
