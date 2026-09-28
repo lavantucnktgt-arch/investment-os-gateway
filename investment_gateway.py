@@ -76,7 +76,16 @@ async def breadth():
     async with httpx.AsyncClient(timeout=30) as client:
 
         # 1. Get full market universe
-        universe_response = await client.get(symbols_url)
+        universe_response = await client.get(
+            symbols_url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140.0 Safari/537.36",
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Referer": "https://trading.vietcap.com.vn/",
+                "Origin": "https://trading.vietcap.com.vn"
+            }
+        )
         universe_response.raise_for_status()
 
         universe = universe_response.json()
