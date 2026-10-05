@@ -184,7 +184,6 @@ async with httpx.AsyncClient(timeout=60) as price_client:
                 "batch_start": i,
                 "error": str(exc)
             })
-                })
 
         # 3. Calculate market breadth
         advances = 0
