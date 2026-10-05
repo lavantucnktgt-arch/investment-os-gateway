@@ -119,17 +119,17 @@ async def breadth():
         # 2. Get realtime prices in batches
         prices = []
 
-batch_size = 50
+    batch_size = 50
+    
+    total_batches = (
+        len(symbols) + batch_size - 1
+    ) // batch_size
 
-total_batches = (
-    len(symbols) + batch_size - 1
-) // batch_size
+    successful_batches = 0
+    failed_batches = 0
 
-successful_batches = 0
-failed_batches = 0
-
-failed_batch_details = []
-
+    failed_batch_details = []
+    
 async with httpx.AsyncClient(timeout=60) as price_client:
 
     for i in range(
