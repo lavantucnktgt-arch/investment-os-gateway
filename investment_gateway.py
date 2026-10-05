@@ -1,6 +1,3 @@
-Investment OS Data Gateway
-Market + Breadth + Leader
-Bản thay thế toàn bộ investment_gateway.py. Copy toàn bộ phần code bên dưới và paste đè file cũ. Không cần chèn từng đoạn.
 from fastapi import FastAPI, Query
 import httpx
  
@@ -8,7 +5,7 @@ from adapters.dnse import fetch_dnse_ohlcv
  
  
 app = FastAPI(
-    title="Investment OS Data Gateway",
+    title="Investment OS Data Gateway",	
     version="1.0.0",
 )
  
