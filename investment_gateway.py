@@ -129,12 +129,14 @@ async def breadth():
     failed_batches = 0
 
     failed_batch_details = []
-    
-    for i in range(
+
+    async with httpx.AsyncClient(timeout=60) as price_client:
+        
+        for i in range(
         0,
         len(symbols),
         batch_size
-    ):
+ ):
 
         batch = symbols[
             i:i + batch_size
@@ -142,7 +144,7 @@ async def breadth():
 
         try:
 
-            response = await client.post(
+            response = await price_client.post(
                 price_url,
                 json={
                     "symbols": batch
