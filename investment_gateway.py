@@ -416,8 +416,26 @@ async def groups(
         le=4,
         description="Cấp ICB dùng để gom nhóm ngành; mặc định cấp 2",
     ),
+    top_n: int = Query(
+        5,
+        ge=3,
+        le=10,
+        description="Số nhóm mạnh/yếu trả về ở phần tóm tắt",
+    ),
+    leaders_per_group: int = Query(
+        3,
+        ge=1,
+        le=5,
+        description="Số cổ phiếu dẫn đầu mỗi nhóm",
+    ),
 ):
-    """Aggregate market breadth by ICB industry."""
+    """
+    Group V2:
+    - Aggregate breadth by ICB group.
+    - Rank strong and weak groups.
+    - Link each group to its leading stocks.
+    - Keep the output factual; interpretation remains with ORCHESTRATOR.
+    """
     data = await _load_vci_stock_prices()
 
     if "error" in data:
@@ -431,13 +449,11 @@ async def groups(
         icb = await _load_vci_icb_mapping(client, level=level)
 
     mapping = icb["mapping"]
-
     groups_data = {}
     mapped_symbols = 0
     unmapped_symbols = 0
 
     # Build symbol -> ICB code from the original getAll universe.
-    # The current price-board response does not reliably carry ICB fields.
     universe_items = data.get("universe_items", [])
     symbol_to_code = {}
 
@@ -450,6 +466,9 @@ async def groups(
 
         if symbol and code:
             symbol_to_code[str(symbol).upper()] = code
+
+    # Parse price-board data once and attach each stock to its group.
+    all_stocks = []
 
     for item in data["prices"]:
         row = _extract_stock_row(item)
@@ -465,10 +484,16 @@ async def groups(
             continue
 
         group_name = mapping.get(code)
+        mapping_source = "VCI_ICB"
 
         if not group_name:
             group_name = f"ICB {code}"
+            mapping_source = "ICB_CODE_FALLBACK"
 
+        row["icb_code"] = code
+        row["group"] = group_name
+        row["mapping_source"] = mapping_source
+        all_stocks.append(row)
         mapped_symbols += 1
 
         if group_name not in groups_data:
@@ -481,10 +506,15 @@ async def groups(
                 "unchanged": 0,
                 "strong_advances_5pct": 0,
                 "strong_declines_5pct": 0,
+                "leaders": [],
+                "total_volume": 0,
+                "avg_change_pct_sum": 0.0,
             }
 
         group = groups_data[group_name]
         group["stocks"] += 1
+        group["total_volume"] += row["volume"]
+        group["avg_change_pct_sum"] += row["change_pct"]
 
         change_pct = row["change_pct"]
 
@@ -500,36 +530,137 @@ async def groups(
         elif change_pct <= -5:
             group["strong_declines_5pct"] += 1
 
+        group["leaders"].append(row)
+
     result = []
 
     for group in groups_data.values():
         stocks = group["stocks"]
+
         group["advance_ratio"] = round(
             group["advances"] / stocks * 100,
             2,
         ) if stocks else 0
+
         group["decline_ratio"] = round(
             group["declines"] / stocks * 100,
             2,
         ) if stocks else 0
+
         group["breadth_score"] = round(
             (group["advances"] - group["declines"]) / stocks * 100,
             2,
         ) if stocks else 0
+
+        group["avg_change_pct"] = round(
+            group["avg_change_pct_sum"] / stocks,
+            2,
+        ) if stocks else 0
+
+        group["volume_total"] = int(group.pop("total_volume", 0))
+        group.pop("avg_change_pct_sum", None)
+
+        # Leader ranking is deliberately simple and transparent:
+        # price strength first, then traded volume.
+        leaders = sorted(
+            group.pop("leaders", []),
+            key=lambda x: (
+                x["change_pct"],
+                x["volume"],
+            ),
+            reverse=True,
+        )[:leaders_per_group]
+
+        group["leaders"] = [
+            {
+                "symbol": stock["symbol"],
+                "change_pct": stock["change_pct"],
+                "volume": stock["volume"],
+                "volume_source": stock["volume_source"],
+            }
+            for stock in leaders
+        ]
+
+        if group["breadth_score"] >= 25:
+            group["strength"] = "STRONG"
+        elif group["breadth_score"] >= 10:
+            group["strength"] = "POSITIVE"
+        elif group["breadth_score"] <= -25:
+            group["strength"] = "WEAK"
+        elif group["breadth_score"] <= -10:
+            group["strength"] = "NEGATIVE"
+        else:
+            group["strength"] = "NEUTRAL"
+
         result.append(group)
 
+    # Rank groups by breadth first, then average price change.
     result.sort(
         key=lambda x: (
             x["breadth_score"],
+            x["avg_change_pct"],
             x["advance_ratio"],
             x["stocks"],
         ),
         reverse=True,
     )
 
+    for rank, group in enumerate(result, start=1):
+        group["rank"] = rank
+
+    strong_groups = [
+        group for group in result
+        if group["breadth_score"] > 0
+    ][:top_n]
+
+    weak_groups = sorted(
+        [
+            group for group in result
+            if group["breadth_score"] < 0
+        ],
+        key=lambda x: (
+            x["breadth_score"],
+            x["avg_change_pct"],
+        ),
+    )[:top_n]
+
+    # Compact summaries are intended for the ORCHESTRATOR.
+    top_strong_groups = [
+        {
+            "rank": group["rank"],
+            "group": group["group"],
+            "icb_code": group["icb_code"],
+            "stocks": group["stocks"],
+            "advance_ratio": group["advance_ratio"],
+            "decline_ratio": group["decline_ratio"],
+            "breadth_score": group["breadth_score"],
+            "avg_change_pct": group["avg_change_pct"],
+            "strength": group["strength"],
+            "leaders": group["leaders"],
+        }
+        for group in strong_groups
+    ]
+
+    top_weak_groups = [
+        {
+            "rank": group["rank"],
+            "group": group["group"],
+            "icb_code": group["icb_code"],
+            "stocks": group["stocks"],
+            "advance_ratio": group["advance_ratio"],
+            "decline_ratio": group["decline_ratio"],
+            "breadth_score": group["breadth_score"],
+            "avg_change_pct": group["avg_change_pct"],
+            "strength": group["strength"],
+            "leaders": group["leaders"],
+        }
+        for group in weak_groups
+    ]
+
     return {
         "source": "VCI",
         "status": "OK",
+        "version": "2.0",
         "icb_level": level,
         "mapping_status": icb["status"],
         "mapping_rows": icb["rows"],
@@ -544,6 +675,8 @@ async def groups(
         "mapped_symbols": mapped_symbols,
         "unmapped_symbols": unmapped_symbols,
         "groups_count": len(result),
+        "top_strong_groups": top_strong_groups,
+        "top_weak_groups": top_weak_groups,
         "groups": result,
         "failed_batch_details": data["failed_batch_details"],
     }
