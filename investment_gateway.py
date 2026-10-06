@@ -125,134 +125,55 @@ def _market_snapshot(candles):
     }
 
 
-def _collect_volume_candidates(obj, found=None, path=""):
-    if found is None:
-        found = []
-
-    if not isinstance(obj, dict):
-        return found
-
-    excluded_words = (
-        "foreign",
-        "bid",
-        "ask",
-        "room",
-        "listed",
-        "ceiling",
-        "floor",
-    )
-
-    preferred_words = (
-        "totalvolume",
-        "total_volume",
-        "totalvol",
-        "total_vol",
-        "totalqty",
-        "total_qty",
-        "totalquantity",
-        "total_quantity",
-        "tradedvolume",
-        "traded_volume",
-        "tradingvolume",
-        "trading_volume",
-        "matchedvolume",
-        "matched_volume",
-        "totalmatchedvolume",
-        "total_matched_volume",
-        "totalmatchvolume",
-        "total_match_volume",
-        "volume",
-        "vol",
-    )
-
-    for key, value in obj.items():
-        key_text = str(key).lower().replace("-", "_").replace(" ", "_")
-        key_compact = key_text.replace("_", "")
-
-        current_path = f"{path}.{key}" if path else str(key)
-
-        if isinstance(value, dict):
-            _collect_volume_candidates(value, found, current_path)
-            continue
-
-        if isinstance(value, list):
-            continue
-
-        if any(word in key_text for word in excluded_words):
-            continue
-
-        is_candidate = (
-            key_text in preferred_words
-            or key_compact in {
-                word.replace("_", "")
-                for word in preferred_words
-            }
-        )
-
-        if not is_candidate:
-            continue
-
-        number = _float(value, -1)
-
-        if number > 0:
-            found.append({
-                "key": str(key),
-                "path": current_path,
-                "value": number,
-            })
-
-    return found
-
-
 def _extract_volume(item):
-    candidates = _collect_volume_candidates(item)
-
-    if not candidates:
+    """
+    VCI raw price-board data stores the session's accumulated
+    traded volume inside matchPrice.accumulatedVolume.
+    Use that field first, then fall back to other known fields.
+    """
+    if not isinstance(item, dict):
         return 0.0, "not_found"
 
-    priority = {
-        "totalvolume": 100,
-        "total_volume": 100,
-        "totalvol": 95,
-        "total_vol": 95,
-        "totalqty": 95,
-        "total_qty": 95,
-        "totalquantity": 95,
-        "total_quantity": 95,
-        "totalmatchedvolume": 90,
-        "total_matched_volume": 90,
-        "totalmatchvolume": 90,
-        "total_match_volume": 90,
-        "tradedvolume": 85,
-        "traded_volume": 85,
-        "tradingvolume": 85,
-        "trading_volume": 85,
-        "matchedvolume": 80,
-        "matched_volume": 80,
-        "volume": 60,
-        "vol": 50,
-    }
+    match = item.get("matchPrice") or {}
 
-    ranked = sorted(
-        candidates,
-        key=lambda x: (
-            priority.get(x["key"].lower(), 0),
-            x["value"],
-        ),
-        reverse=True,
-    )
+    if isinstance(match, dict):
+        for key in (
+            "accumulatedVolume",
+            "accumulated_volume",
+            "totalVolume",
+            "total_volume",
+            "tradedVolume",
+            "traded_volume",
+            "matchVolume",
+            "matchVol",
+            "volume",
+        ):
+            if key not in match:
+                continue
 
-    best_priority = priority.get(ranked[0]["key"].lower(), 0)
+            value = _float(match.get(key), -1)
 
-    same_priority = [
-        item
-        for item in candidates
-        if priority.get(item["key"].lower(), 0) == best_priority
-    ]
+            if value > 0:
+                return value, f"matchPrice.{key}"
 
-    best = max(same_priority, key=lambda x: x["value"])
+    for key in (
+        "accumulatedVolume",
+        "accumulated_volume",
+        "totalVolume",
+        "total_volume",
+        "tradedVolume",
+        "traded_volume",
+        "volume",
+    ):
+        if key not in item:
+            continue
 
-    return best["value"], best["path"]
+        value = _float(item.get(key), -1)
+
+        if value > 0:
+            return value, key
+
+    return 0.0, "not_found"
 
 
 def _extract_stock_row(item):
@@ -525,28 +446,6 @@ async def breadth():
         "strong_advances_5pct": strong_advances,
         "strong_declines_5pct": strong_declines,
         "failed_batch_details": data["failed_batch_details"],
-    }
-
-
-@app.get("/debug-vci")
-async def debug_vci():
-    payload = {
-        "symbols": ["VCI", "VCB", "ACB"]
-    }
-
-    async with httpx.AsyncClient(timeout=30) as client:
-        response = await client.post(
-            VCI_PRICE_URL,
-            headers=VCI_HEADERS,
-            json=payload,
-        )
-
-    return {
-        "status": response.status_code,
-        "source": "VCI",
-        "success": response.is_success,
-        "request_symbols": payload["symbols"],
-        "data": response.json(),
     }
 
 
