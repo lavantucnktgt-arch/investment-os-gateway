@@ -528,6 +528,28 @@ async def breadth():
     }
 
 
+@app.get("/debug-vci")
+async def debug_vci():
+    payload = {
+        "symbols": ["VCI", "VCB", "ACB"]
+    }
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.post(
+            VCI_PRICE_URL,
+            headers=VCI_HEADERS,
+            json=payload,
+        )
+
+    return {
+        "status": response.status_code,
+        "source": "VCI",
+        "success": response.is_success,
+        "request_symbols": payload["symbols"],
+        "data": response.json(),
+    }
+
+
 @app.get("/leaders")
 async def leaders():
     data = await _load_vci_stock_prices()
