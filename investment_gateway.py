@@ -810,8 +810,39 @@ async def breadth():
     }
 
 
+
 @app.get("/leaders")
-async def leaders():
+async def leaders(
+    top_n: int = Query(
+        20,
+        ge=5,
+        le=50,
+        description="Số cổ phiếu dẫn dắt trả về",
+    ),
+    min_volume: int = Query(
+        100000,
+        ge=0,
+        description="Thanh khoản phiên tối thiểu",
+    ),
+    min_price: float = Query(
+        10000,
+        ge=0,
+        description="Thị giá tối thiểu",
+    ),
+):
+    """
+    Leader V2.
+
+    Mục tiêu:
+    - Không chỉ xếp theo % tăng.
+    - Kết hợp tăng giá, thanh khoản, sức mạnh tương đối
+      so với VN-Index và sức mạnh của nhóm ngành.
+    - Gắn mỗi cổ phiếu với nhóm ngành.
+    - Có bộ lọc giá/thanh khoản mặc định phù hợp với
+      nguyên tắc sàng lọc của Investment OS.
+    - Chỉ cung cấp dữ liệu và điểm số minh bạch;
+      ORCHESTRATOR/Decision Engine mới đưa ra kết luận đầu tư.
+    """
     data = await _load_vci_stock_prices()
 
     if "error" in data:
@@ -821,56 +852,372 @@ async def leaders():
             "error": data["error"],
         }
 
+    # ---------------------------------------------------------
+    # 1. Load VN-Index data for relative-strength comparison.
+    # ---------------------------------------------------------
+    try:
+        vnindex_daily = await fetch_dnse_ohlcv(
+            symbol="VNINDEX",
+            market="index",
+            resolution="1D",
+            days=30,
+        )
+
+        vnindex_daily = sorted(
+            vnindex_daily,
+            key=lambda x: x.get("time", 0),
+        )
+
+        if len(vnindex_daily) >= 2:
+            vnindex_last = _float(vnindex_daily[-1].get("close"))
+            vnindex_prev = _float(vnindex_daily[-2].get("close"))
+
+            if vnindex_prev > 0:
+                vnindex_change_pct = round(
+                    (vnindex_last / vnindex_prev - 1) * 100,
+                    2,
+                )
+            else:
+                vnindex_change_pct = 0.0
+        else:
+            vnindex_change_pct = 0.0
+
+        market_data_status = "OK"
+
+    except Exception as exc:
+        vnindex_change_pct = 0.0
+        market_data_status = "ERROR"
+        market_data_error = str(exc)
+
+    if market_data_status == "OK":
+        market_data_error = None
+
+    # ---------------------------------------------------------
+    # 2. Load ICB level-2 mapping.
+    # ---------------------------------------------------------
+    async with httpx.AsyncClient(timeout=30) as client:
+        icb = await _load_vci_icb_mapping(client, level=2)
+
+    mapping = icb["mapping"]
+
+    # Build symbol -> ICB code from getAll universe.
+    symbol_to_code = {}
+
+    for item in data.get("universe_items", []):
+        if not isinstance(item, dict):
+            continue
+
+        symbol = item.get("symbol")
+        code = _extract_icb_code(item)
+
+        if symbol and code:
+            symbol_to_code[str(symbol).upper()] = code
+
+    # ---------------------------------------------------------
+    # 3. Parse current stock board once.
+    # ---------------------------------------------------------
     stocks = []
 
     for item in data["prices"]:
         row = _extract_stock_row(item)
 
-        if row:
-            stocks.append(row)
+        if not row:
+            continue
 
-    top_gainers = sorted(
-        stocks,
-        key=lambda x: x["change_pct"],
+        symbol = str(row["symbol"]).upper()
+        code = symbol_to_code.get(symbol)
+
+        if code:
+            group_name = mapping.get(code)
+
+            if group_name:
+                mapping_source = "VCI_ICB"
+            else:
+                group_name = f"ICB {code}"
+                mapping_source = "ICB_CODE_FALLBACK"
+        else:
+            group_name = "UNKNOWN"
+            code = None
+            mapping_source = "UNMAPPED"
+
+        row["symbol"] = symbol
+        row["icb_code"] = code
+        row["group"] = group_name
+        row["mapping_source"] = mapping_source
+
+        row["rs_vs_vnindex_pct"] = round(
+            row["change_pct"] - vnindex_change_pct,
+            2,
+        )
+
+        stocks.append(row)
+
+    # ---------------------------------------------------------
+    # 4. Group breadth from the same price-board snapshot.
+    # ---------------------------------------------------------
+    group_stats = {}
+
+    for stock in stocks:
+        group = stock["group"]
+
+        if group not in group_stats:
+            group_stats[group] = {
+                "group": group,
+                "icb_code": stock["icb_code"],
+                "stocks": 0,
+                "advances": 0,
+                "declines": 0,
+                "unchanged": 0,
+            }
+
+        stats = group_stats[group]
+        stats["stocks"] += 1
+
+        if stock["change_pct"] > 0:
+            stats["advances"] += 1
+        elif stock["change_pct"] < 0:
+            stats["declines"] += 1
+        else:
+            stats["unchanged"] += 1
+
+    for stats in group_stats.values():
+        stocks_count = stats["stocks"]
+
+        stats["advance_ratio"] = round(
+            stats["advances"] / stocks_count * 100,
+            2,
+        ) if stocks_count else 0
+
+        stats["decline_ratio"] = round(
+            stats["declines"] / stocks_count * 100,
+            2,
+        ) if stocks_count else 0
+
+        stats["breadth_score"] = round(
+            (
+                stats["advances"] - stats["declines"]
+            ) / stocks_count * 100,
+            2,
+        ) if stocks_count else 0
+
+    # ---------------------------------------------------------
+    # 5. Volume percentile.
+    # ---------------------------------------------------------
+    positive_volume_stocks = sorted(
+        [
+            stock for stock in stocks
+            if stock["volume"] > 0
+        ],
+        key=lambda x: x["volume"],
+    )
+
+    volume_count = len(positive_volume_stocks)
+    volume_rank_map = {}
+
+    for rank, stock in enumerate(
+        positive_volume_stocks,
+        start=1,
+    ):
+        if volume_count <= 1:
+            percentile = 100.0
+        else:
+            percentile = round(
+                (rank - 1) / (volume_count - 1) * 100,
+                2,
+            )
+
+        volume_rank_map[stock["symbol"]] = {
+            "rank": rank,
+            "percentile": percentile,
+        }
+
+    # ---------------------------------------------------------
+    # 6. Leader score.
+    #
+    # Score components:
+    # - price strength:        0-40
+    # - volume percentile:    0-25
+    # - relative strength:    0-20
+    # - group breadth:        0-15
+    #
+    # Total: 0-100
+    # ---------------------------------------------------------
+    eligible = []
+
+    for stock in stocks:
+        group = group_stats.get(stock["group"], {})
+
+        volume_info = volume_rank_map.get(
+            stock["symbol"],
+            {
+                "rank": None,
+                "percentile": 0.0,
+            },
+        )
+
+        # Price strength:
+        # 0 at <= 0%; 40 at >= +5%.
+        price_component = min(
+            max(stock["change_pct"], 0) / 5 * 40,
+            40,
+        )
+
+        volume_component = (
+            volume_info["percentile"] / 100 * 25
+        )
+
+        # Relative strength:
+        # 0 at <= 0%; 20 at >= +5% versus VN-Index.
+        rs_component = min(
+            max(stock["rs_vs_vnindex_pct"], 0) / 5 * 20,
+            20,
+        )
+
+        # Group breadth:
+        # 0 at <= -25; 15 at >= +25.
+        breadth_component = min(
+            max(
+                (group.get("breadth_score", -100) + 25)
+                / 50
+                * 15,
+                0,
+            ),
+            15,
+        )
+
+        leader_score = round(
+            price_component
+            + volume_component
+            + rs_component
+            + breadth_component,
+            2,
+        )
+
+        stock["volume_rank"] = volume_info["rank"]
+        stock["volume_percentile"] = volume_info["percentile"]
+        stock["group_breadth_score"] = group.get(
+            "breadth_score",
+            0,
+        )
+        stock["leader_score"] = leader_score
+
+        # Investment OS default screening:
+        # price > 10,000 and session volume > 100,000.
+        stock["eligible_default"] = (
+            stock["price"] >= min_price
+            and stock["volume"] >= min_volume
+        )
+
+        if stock["eligible_default"]:
+            eligible.append(stock)
+
+    # ---------------------------------------------------------
+    # 7. Rank eligible leaders.
+    # ---------------------------------------------------------
+    eligible.sort(
+        key=lambda x: (
+            x["leader_score"],
+            x["change_pct"],
+            x["rs_vs_vnindex_pct"],
+            x["volume"],
+        ),
         reverse=True,
-    )[:20]
+    )
 
-    stocks_with_volume = [
-        x
-        for x in stocks
-        if x["volume"] > 0
-    ]
+    top_leaders = eligible[:top_n]
+
+    # Secondary lists help ORCHESTRATOR explain why a stock
+    # appears on the leader board.
+    top_gainers = sorted(
+        eligible,
+        key=lambda x: (
+            x["change_pct"],
+            x["volume"],
+        ),
+        reverse=True,
+    )[:top_n]
 
     top_volume = sorted(
-        stocks_with_volume,
+        eligible,
         key=lambda x: x["volume"],
         reverse=True,
-    )[:20]
+    )[:top_n]
 
-    volume_source_counts = {}
+    top_rs = sorted(
+        eligible,
+        key=lambda x: (
+            x["rs_vs_vnindex_pct"],
+            x["change_pct"],
+        ),
+        reverse=True,
+    )[:top_n]
 
-    for stock in stocks_with_volume:
-        source = stock["volume_source"]
-        volume_source_counts[source] = (
-            volume_source_counts.get(source, 0) + 1
-        )
+    def _compact(stock):
+        return {
+            "symbol": stock["symbol"],
+            "price": stock["price"],
+            "change_pct": stock["change_pct"],
+            "rs_vs_vnindex_pct": stock["rs_vs_vnindex_pct"],
+            "volume": stock["volume"],
+            "volume_rank": stock["volume_rank"],
+            "volume_percentile": stock["volume_percentile"],
+            "group": stock["group"],
+            "icb_code": stock["icb_code"],
+            "group_breadth_score": stock["group_breadth_score"],
+            "leader_score": stock["leader_score"],
+            "eligible_default": stock["eligible_default"],
+            "volume_source": stock["volume_source"],
+        }
 
     return {
         "source": "VCI",
         "status": "OK",
+        "version": "2.0",
+        "screen": {
+            "min_price": min_price,
+            "min_volume": min_volume,
+            "top_n": top_n,
+            "default_rule": (
+                "price >= min_price AND "
+                "session_volume >= min_volume"
+            ),
+        },
+        "market_reference": {
+            "symbol": "VNINDEX",
+            "change_pct": vnindex_change_pct,
+            "status": market_data_status,
+            "error": market_data_error,
+        },
         "universe": len(data["symbols"]),
         "total_batches": data["total_batches"],
         "successful_batches": data["successful_batches"],
         "failed_batches": data["failed_batches"],
-        "symbols_received": len(data["prices"]),
         "priced_stocks": len(stocks),
-        "stocks_with_volume": len(stocks_with_volume),
-        "volume_coverage_pct": round(
-            len(stocks_with_volume) / len(stocks) * 100,
-            2,
-        ) if stocks else 0,
-        "volume_source_counts": volume_source_counts,
-        "top_gainers": top_gainers,
-        "top_volume": top_volume,
+        "stocks_with_volume": sum(
+            1 for stock in stocks
+            if stock["volume"] > 0
+        ),
+        "eligible_stocks": len(eligible),
+        "icb_level": 2,
+        "mapping_status": icb["status"],
+        "mapping_rows": icb["rows"],
+        "mapping_error": icb["error"],
+        "groups_count": len(group_stats),
+        "top_leaders": [
+            _compact(stock)
+            for stock in top_leaders
+        ],
+        "top_gainers": [
+            _compact(stock)
+            for stock in top_gainers
+        ],
+        "top_volume": [
+            _compact(stock)
+            for stock in top_volume
+        ],
+        "top_rs_vs_vnindex": [
+            _compact(stock)
+            for stock in top_rs
+        ],
         "failed_batch_details": data["failed_batch_details"],
     }
