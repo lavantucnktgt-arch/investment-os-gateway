@@ -12,6 +12,7 @@ app = FastAPI(
 
 VCI_SYMBOLS_URL = "https://trading.vietcap.com.vn/api/price/symbols/getAll"
 VCI_PRICE_URL = "https://trading.vietcap.com.vn/api/price/symbols/getList"
+VCI_ICB_URL = "https://iq.vietcap.com.vn/api/iq-insight-service/v1/sectors/icb-codes"
 
 VCI_HEADERS = {
     "User-Agent": (
@@ -232,6 +233,8 @@ async def _load_vci_stock_prices():
 
         universe = universe_response.json()
 
+        universe_items = universe if isinstance(universe, list) else (universe.get("data", []) if isinstance(universe, dict) else [])
+
         if isinstance(universe, dict):
             universe = universe.get("data", [])
 
@@ -314,10 +317,235 @@ async def _load_vci_stock_prices():
     return {
         "symbols": symbols,
         "prices": prices,
+        "universe_items": universe_items,
         "total_batches": total_batches,
         "successful_batches": successful_batches,
         "failed_batches": failed_batches,
         "failed_batch_details": failed_batch_details,
+    }
+
+
+
+
+async def _load_vci_icb_mapping(client, level=2):
+    """Load ICB code -> Vietnamese industry name mapping from VCI."""
+    try:
+        response = await client.get(
+            VCI_ICB_URL,
+            headers=VCI_HEADERS,
+        )
+
+        if not response.is_success:
+            return {
+                "status": "ERROR",
+                "error": f"icb-codes failed: HTTP {response.status_code}",
+                "mapping": {},
+                "rows": 0,
+            }
+
+        payload = response.json()
+        rows = payload.get("data", []) if isinstance(payload, dict) else []
+
+        if not isinstance(rows, list):
+            rows = []
+
+        mapping = {}
+
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+
+            item_level = item.get("icbLevel")
+            try:
+                item_level = int(item_level)
+            except (TypeError, ValueError):
+                continue
+
+            if item_level != level:
+                continue
+
+            code = item.get("name")
+            name = item.get("viSector") or item.get("enSector")
+
+            if code is None or not name:
+                continue
+
+            mapping[str(code).strip()] = str(name).strip()
+
+        if not mapping:
+            return {
+                "status": "ERROR",
+                "error": f"No ICB mapping found at level {level}",
+                "mapping": {},
+                "rows": len(rows),
+            }
+
+        return {
+            "status": "OK",
+            "error": None,
+            "mapping": mapping,
+            "rows": len(rows),
+        }
+
+    except Exception as exc:
+        return {
+            "status": "ERROR",
+            "error": str(exc),
+            "mapping": {},
+            "rows": 0,
+        }
+
+
+def _extract_icb_code(item):
+    if not isinstance(item, dict):
+        return None
+
+    for key in ("icbCode2", "icb_code2", "icbCode"):
+        value = item.get(key)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+
+    return None
+
+
+@app.get("/groups")
+async def groups(
+    level: int = Query(
+        2,
+        ge=1,
+        le=4,
+        description="Cấp ICB dùng để gom nhóm ngành; mặc định cấp 2",
+    ),
+):
+    """Aggregate market breadth by ICB industry."""
+    data = await _load_vci_stock_prices()
+
+    if "error" in data:
+        return {
+            "source": "VCI",
+            "status": "ERROR",
+            "error": data["error"],
+        }
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        icb = await _load_vci_icb_mapping(client, level=level)
+
+    mapping = icb["mapping"]
+
+    groups_data = {}
+    mapped_symbols = 0
+    unmapped_symbols = 0
+
+    # Build symbol -> ICB code from the original getAll universe.
+    # The current price-board response does not reliably carry ICB fields.
+    universe_items = data.get("universe_items", [])
+    symbol_to_code = {}
+
+    for item in universe_items:
+        if not isinstance(item, dict):
+            continue
+
+        symbol = item.get("symbol")
+        code = _extract_icb_code(item)
+
+        if symbol and code:
+            symbol_to_code[str(symbol).upper()] = code
+
+    for item in data["prices"]:
+        row = _extract_stock_row(item)
+
+        if not row:
+            continue
+
+        symbol = str(row["symbol"]).upper()
+        code = symbol_to_code.get(symbol)
+
+        if not code:
+            unmapped_symbols += 1
+            continue
+
+        group_name = mapping.get(code)
+
+        if not group_name:
+            group_name = f"ICB {code}"
+
+        mapped_symbols += 1
+
+        if group_name not in groups_data:
+            groups_data[group_name] = {
+                "group": group_name,
+                "icb_code": code,
+                "stocks": 0,
+                "advances": 0,
+                "declines": 0,
+                "unchanged": 0,
+                "strong_advances_5pct": 0,
+                "strong_declines_5pct": 0,
+            }
+
+        group = groups_data[group_name]
+        group["stocks"] += 1
+
+        change_pct = row["change_pct"]
+
+        if change_pct > 0:
+            group["advances"] += 1
+        elif change_pct < 0:
+            group["declines"] += 1
+        else:
+            group["unchanged"] += 1
+
+        if change_pct >= 5:
+            group["strong_advances_5pct"] += 1
+        elif change_pct <= -5:
+            group["strong_declines_5pct"] += 1
+
+    result = []
+
+    for group in groups_data.values():
+        stocks = group["stocks"]
+        group["advance_ratio"] = round(
+            group["advances"] / stocks * 100,
+            2,
+        ) if stocks else 0
+        group["decline_ratio"] = round(
+            group["declines"] / stocks * 100,
+            2,
+        ) if stocks else 0
+        group["breadth_score"] = round(
+            (group["advances"] - group["declines"]) / stocks * 100,
+            2,
+        ) if stocks else 0
+        result.append(group)
+
+    result.sort(
+        key=lambda x: (
+            x["breadth_score"],
+            x["advance_ratio"],
+            x["stocks"],
+        ),
+        reverse=True,
+    )
+
+    return {
+        "source": "VCI",
+        "status": "OK",
+        "icb_level": level,
+        "mapping_status": icb["status"],
+        "mapping_rows": icb["rows"],
+        "mapping_error": icb["error"],
+        "universe": len(data["symbols"]),
+        "total_batches": data["total_batches"],
+        "successful_batches": data["successful_batches"],
+        "failed_batches": data["failed_batches"],
+        "priced_stocks": sum(
+            1 for item in data["prices"] if _extract_stock_row(item)
+        ),
+        "mapped_symbols": mapped_symbols,
+        "unmapped_symbols": unmapped_symbols,
+        "groups_count": len(result),
+        "groups": result,
+        "failed_batch_details": data["failed_batch_details"],
     }
 
 
