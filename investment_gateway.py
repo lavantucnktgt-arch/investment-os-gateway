@@ -1,4 +1,6 @@
 from fastapi import FastAPI, Query
+import asyncio
+import time
 import httpx
 
 from adapters.dnse import fetch_dnse_ohlcv
@@ -1220,4 +1222,125 @@ async def leaders(
             for stock in top_rs
         ],
         "failed_batch_details": data["failed_batch_details"],
+    }
+
+
+async def _load_rs_history_batch(
+    symbols,
+    days=600,
+    concurrency=8,
+):
+    """Fetch historical daily candles concurrently for RS-engine validation.
+
+    This is a data-engine test only. It does not calculate or rank RS yet.
+    The production RS engine will use the same batch mechanism after the
+    request-time performance is validated.
+    """
+    semaphore = asyncio.Semaphore(max(1, min(concurrency, 20)))
+
+    async def fetch_one(symbol):
+        async with semaphore:
+            started = time.perf_counter()
+            try:
+                candles = await fetch_dnse_ohlcv(
+                    symbol=symbol,
+                    market="stock",
+                    resolution="1D",
+                    days=days,
+                )
+                elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
+                candles = candles if isinstance(candles, list) else []
+                candles = sorted(candles, key=lambda x: x.get("time", 0))
+                return {
+                    "symbol": symbol,
+                    "status": "OK" if candles else "EMPTY",
+                    "count": len(candles),
+                    "first_time": candles[0].get("time") if candles else None,
+                    "last_time": candles[-1].get("time") if candles else None,
+                    "elapsed_ms": elapsed_ms,
+                }
+            except Exception as exc:
+                return {
+                    "symbol": symbol,
+                    "status": "ERROR",
+                    "count": 0,
+                    "first_time": None,
+                    "last_time": None,
+                    "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
+                    "error": str(exc),
+                }
+
+    return await asyncio.gather(*(fetch_one(symbol) for symbol in symbols))
+
+
+@app.get("/rs-history-test")
+async def rs_history_test(
+    limit: int = Query(
+        20,
+        ge=5,
+        le=100,
+        description="Số mã dùng để benchmark lấy lịch sử RS",
+    ),
+    days: int = Query(
+        600,
+        ge=300,
+        le=900,
+        description="Số ngày lịch sử cần lấy; 600 là mặc định để có đủ ~12 tháng giao dịch",
+    ),
+    concurrency: int = Query(
+        8,
+        ge=1,
+        le=20,
+        description="Số request lịch sử chạy đồng thời",
+    ),
+):
+    """Benchmark the bulk historical-data mechanism before full-market RS.
+
+    It uses the VCI universe to select stock symbols, then fetches DNSE daily
+    history concurrently. The endpoint intentionally stops at data validation;
+    no RS score/ranking is produced here.
+    """
+    started = time.perf_counter()
+
+    data = await _load_vci_stock_prices()
+
+    if "error" in data:
+        return {
+            "source": "VCI + DNSE",
+            "status": "ERROR",
+            "stage": "universe",
+            "error": data["error"],
+        }
+
+    symbols = data.get("symbols", [])[:limit]
+    results = await _load_rs_history_batch(
+        symbols=symbols,
+        days=days,
+        concurrency=concurrency,
+    )
+
+    ok = [item for item in results if item["status"] == "OK"]
+    empty = [item for item in results if item["status"] == "EMPTY"]
+    errors = [item for item in results if item["status"] == "ERROR"]
+
+    counts = [item["count"] for item in ok]
+    elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
+
+    return {
+        "source": "VCI + DNSE",
+        "status": "OK" if not errors else "PARTIAL",
+        "purpose": "RS batch history benchmark; no RS ranking yet",
+        "requested_symbols": len(symbols),
+        "successful_symbols": len(ok),
+        "empty_symbols": len(empty),
+        "failed_symbols": len(errors),
+        "history_days_requested": days,
+        "concurrency": concurrency,
+        "min_candles": min(counts) if counts else 0,
+        "max_candles": max(counts) if counts else 0,
+        "avg_candles": round(sum(counts) / len(counts), 2) if counts else 0,
+        "symbols_below_250": sum(1 for count in counts if count < 250),
+        "symbols_at_least_250": sum(1 for count in counts if count >= 250),
+        "elapsed_ms": elapsed_ms,
+        "results": results,
     }
