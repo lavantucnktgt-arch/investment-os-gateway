@@ -1,14 +1,14 @@
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, BackgroundTasks
 import asyncio
 import time
 import httpx
 
 from adapters.dnse import fetch_dnse_ohlcv
-
+	
 
 app = FastAPI(
     title="Investment OS Data Gateway",
-    version="1.0.0",
+    version="3.0.0",
 )
 
 
@@ -813,6 +813,421 @@ async def breadth():
 
 
 
+
+# ---------------------------------------------------------------------------
+# RS O'NEIL ENGINE CACHE
+# ---------------------------------------------------------------------------
+
+RS_CACHE = {
+    "status": "EMPTY",
+    "started_at": None,
+    "finished_at": None,
+    "elapsed_ms": None,
+    "requested_symbols": 0,
+    "successful_symbols": 0,
+    "eligible_symbols": 0,
+    "empty_symbols": 0,
+    "failed_symbols": 0,
+    "days": 600,
+    "concurrency": 16,
+    "rows": [],
+    "by_symbol": {},
+    "errors": [],
+}
+
+
+def _quarter_return(closes, end_offset, start_offset):
+    """Return percentage change between two trading-session offsets."""
+    end_index = len(closes) - 1 - end_offset
+    start_index = len(closes) - 1 - start_offset
+
+    if start_index < 0 or end_index < 0:
+        return None
+
+    start_price = _float(closes[start_index])
+    end_price = _float(closes[end_index])
+
+    if start_price <= 0:
+        return None
+
+    return (end_price / start_price - 1) * 100
+
+
+def _oneil_price_score(candles):
+    """
+    Investment OS implementation of the agreed O'Neil-style RS framework.
+
+    Four independent ~3-month trading blocks:
+      Q1: latest 60 sessions          -> 40%
+      Q2: prior 60 sessions           -> 20%
+      Q3: prior 60 sessions           -> 20%
+      Q4: prior 60 sessions           -> 20%
+
+    Minimum history rule remains >= 250 valid daily candles.
+    VN-Index is NOT used in this calculation.
+    """
+    candles = [
+        item for item in candles
+        if isinstance(item, dict) and _float(item.get("close")) > 0
+    ]
+    candles = sorted(candles, key=lambda x: x.get("time", 0))
+
+    if len(candles) < 250:
+        return None
+
+    closes = [_float(item.get("close")) for item in candles]
+
+    q1 = _quarter_return(closes, 0, 60)
+    q2 = _quarter_return(closes, 60, 120)
+    q3 = _quarter_return(closes, 120, 180)
+    q4 = _quarter_return(closes, 180, 240)
+
+    if any(value is None for value in (q1, q2, q3, q4)):
+        return None
+
+    p_score = (
+        0.40 * q1
+        + 0.20 * q2
+        + 0.20 * q3
+        + 0.20 * q4
+    )
+
+    return {
+        "q1_3m_pct": round(q1, 2),
+        "q2_prev_3m_pct": round(q2, 2),
+        "q3_prev_3m_pct": round(q3, 2),
+        "q4_prev_3m_pct": round(q4, 2),
+        "p_score": round(p_score, 4),
+        "candles": len(candles),
+        "first_time": candles[0].get("time"),
+        "last_time": candles[-1].get("time"),
+    }
+
+
+def _assign_rs_ratings(rows):
+    """
+    Convert P_Score cross-section into RS Rating 1-99.
+    Highest P_Score receives 99; lowest receives 1.
+    """
+    ranked = sorted(rows, key=lambda x: x["p_score"])
+
+    n = len(ranked)
+    if n == 0:
+        return []
+
+    if n == 1:
+        ranked[0]["rs_rating"] = 99
+        ranked[0]["rs_percentile"] = 100.0
+        return ranked
+
+    # Average percentile for exact P_Score ties.
+    i = 0
+    while i < n:
+        j = i
+        while (
+            j + 1 < n
+            and ranked[j + 1]["p_score"] == ranked[i]["p_score"]
+        ):
+            j += 1
+
+        avg_rank_zero_based = (i + j) / 2
+        percentile = avg_rank_zero_based / (n - 1) * 100
+        rating = int(round(1 + percentile / 100 * 98))
+        rating = max(1, min(99, rating))
+
+        for k in range(i, j + 1):
+            ranked[k]["rs_percentile"] = round(percentile, 2)
+            ranked[k]["rs_rating"] = rating
+
+        i = j + 1
+
+    return sorted(
+        ranked,
+        key=lambda x: (
+            x["rs_rating"],
+            x["p_score"],
+        ),
+        reverse=True,
+    )
+
+
+async def _fetch_rs_history_one(symbol, semaphore, days):
+    async with semaphore:
+        started = time.perf_counter()
+        try:
+            candles = await fetch_dnse_ohlcv(
+                symbol=symbol,
+                market="stock",
+                resolution="1D",
+                days=days,
+            )
+            candles = candles if isinstance(candles, list) else []
+            score = _oneil_price_score(candles)
+
+            return {
+                "symbol": symbol,
+                "status": (
+                    "ELIGIBLE"
+                    if score is not None
+                    else ("INSUFFICIENT_HISTORY" if candles else "EMPTY")
+                ),
+                "count": len(candles),
+                "score": score,
+                "elapsed_ms": round(
+                    (time.perf_counter() - started) * 1000,
+                    1,
+                ),
+            }
+        except Exception as exc:
+            return {
+                "symbol": symbol,
+                "status": "ERROR",
+                "count": 0,
+                "score": None,
+                "elapsed_ms": round(
+                    (time.perf_counter() - started) * 1000,
+                    1,
+                ),
+                "error": str(exc),
+            }
+
+
+async def _refresh_rs_cache(days=600, concurrency=16, limit=0):
+    global RS_CACHE
+
+    if RS_CACHE.get("status") == "RUNNING":
+        return
+
+    started = time.perf_counter()
+    RS_CACHE = {
+        "status": "RUNNING",
+        "started_at": time.time(),
+        "finished_at": None,
+        "elapsed_ms": None,
+        "requested_symbols": 0,
+        "successful_symbols": 0,
+        "eligible_symbols": 0,
+        "empty_symbols": 0,
+        "failed_symbols": 0,
+        "days": days,
+        "concurrency": concurrency,
+        "rows": [],
+        "by_symbol": {},
+        "errors": [],
+    }
+
+    try:
+        data = await _load_vci_stock_prices()
+
+        if "error" in data:
+            RS_CACHE["status"] = "ERROR"
+            RS_CACHE["errors"] = [data["error"]]
+            return
+
+        symbols = data.get("symbols", [])
+        if limit and limit > 0:
+            symbols = symbols[:limit]
+
+        RS_CACHE["requested_symbols"] = len(symbols)
+
+        semaphore = asyncio.Semaphore(
+            max(1, min(int(concurrency), 20))
+        )
+
+        tasks = [
+            _fetch_rs_history_one(symbol, semaphore, days)
+            for symbol in symbols
+        ]
+        results = await asyncio.gather(*tasks)
+
+        eligible_rows = []
+        empty_symbols = 0
+        failed_symbols = 0
+        successful_symbols = 0
+        errors = []
+
+        for item in results:
+            if item["status"] == "ERROR":
+                failed_symbols += 1
+                errors.append({
+                    "symbol": item["symbol"],
+                    "error": item.get("error"),
+                })
+                continue
+
+            if item["status"] == "EMPTY":
+                empty_symbols += 1
+                continue
+
+            successful_symbols += 1
+
+            if item["status"] != "ELIGIBLE":
+                continue
+
+            score = item["score"]
+            eligible_rows.append({
+                "symbol": item["symbol"],
+                "candles": score["candles"],
+                "first_time": score["first_time"],
+                "last_time": score["last_time"],
+                "q1_3m_pct": score["q1_3m_pct"],
+                "q2_prev_3m_pct": score["q2_prev_3m_pct"],
+                "q3_prev_3m_pct": score["q3_prev_3m_pct"],
+                "q4_prev_3m_pct": score["q4_prev_3m_pct"],
+                "p_score": score["p_score"],
+            })
+
+        ranked = _assign_rs_ratings(eligible_rows)
+
+        RS_CACHE["status"] = (
+            "OK" if failed_symbols == 0 else "PARTIAL"
+        )
+        RS_CACHE["successful_symbols"] = successful_symbols
+        RS_CACHE["eligible_symbols"] = len(ranked)
+        RS_CACHE["empty_symbols"] = empty_symbols
+        RS_CACHE["failed_symbols"] = failed_symbols
+        RS_CACHE["rows"] = ranked
+        RS_CACHE["by_symbol"] = {
+            row["symbol"]: row
+            for row in ranked
+        }
+        RS_CACHE["errors"] = errors[:50]
+
+    except Exception as exc:
+        RS_CACHE["status"] = "ERROR"
+        RS_CACHE["errors"] = [str(exc)]
+
+    finally:
+        RS_CACHE["finished_at"] = time.time()
+        RS_CACHE["elapsed_ms"] = round(
+            (time.perf_counter() - started) * 1000,
+            1,
+        )
+
+
+@app.get("/rs-refresh")
+async def rs_refresh(
+    background_tasks: BackgroundTasks,
+    days: int = Query(
+        600,
+        ge=400,
+        le=900,
+        description="Ngày lịch sử DNSE; mặc định 600",
+    ),
+    concurrency: int = Query(
+        16,
+        ge=1,
+        le=20,
+        description="Số request DNSE đồng thời",
+    ),
+    limit: int = Query(
+        0,
+        ge=0,
+        le=2000,
+        description="0 = toàn universe; >0 = giới hạn số mã",
+    ),
+):
+    """
+    Start an asynchronous full-market O'Neil RS refresh.
+
+    The HTTP request returns immediately. Use /rs-status to monitor progress
+    and /rs after status becomes OK/PARTIAL.
+    """
+    if RS_CACHE.get("status") == "RUNNING":
+        return {
+            "status": "RUNNING",
+            "message": "RS refresh is already running",
+            "requested_symbols": RS_CACHE.get("requested_symbols", 0),
+        }
+
+    background_tasks.add_task(
+        _refresh_rs_cache,
+        days,
+        concurrency,
+        limit,
+    )
+
+    return {
+        "status": "STARTED",
+        "engine": "O'Neil RS",
+        "formula": {
+            "q1_latest_3m": 0.40,
+            "q2_previous_3m": 0.20,
+            "q3_previous_3m": 0.20,
+            "q4_previous_3m": 0.20,
+        },
+        "minimum_candles": 250,
+        "vnindex_in_formula": False,
+        "days": days,
+        "concurrency": concurrency,
+        "limit": limit,
+        "next": "Check /rs-status, then /rs",
+    }
+
+
+@app.get("/rs-status")
+async def rs_status():
+    return {
+        "status": RS_CACHE.get("status"),
+        "requested_symbols": RS_CACHE.get("requested_symbols", 0),
+        "successful_symbols": RS_CACHE.get("successful_symbols", 0),
+        "eligible_symbols": RS_CACHE.get("eligible_symbols", 0),
+        "empty_symbols": RS_CACHE.get("empty_symbols", 0),
+        "failed_symbols": RS_CACHE.get("failed_symbols", 0),
+        "days": RS_CACHE.get("days"),
+        "concurrency": RS_CACHE.get("concurrency"),
+        "elapsed_ms": RS_CACHE.get("elapsed_ms"),
+        "errors": RS_CACHE.get("errors", [])[:10],
+    }
+
+
+@app.get("/rs")
+async def rs_ranking(
+    top_n: int = Query(
+        50,
+        ge=5,
+        le=200,
+        description="Số mã RS cao nhất trả về",
+    ),
+):
+    """
+    Return cached O'Neil RS Ranking.
+    Run /rs-refresh first if status is EMPTY.
+    """
+    status = RS_CACHE.get("status")
+
+    if status not in ("OK", "PARTIAL"):
+        return {
+            "status": status,
+            "message": (
+                "RS ranking is not ready. "
+                "Run /rs-refresh and wait for /rs-status."
+            ),
+            "eligible_symbols": RS_CACHE.get("eligible_symbols", 0),
+        }
+
+    return {
+        "source": "VCI universe + DNSE history",
+        "status": status,
+        "version": "RS_V3_ONEIL",
+        "formula": {
+            "q1_latest_3m": "40%",
+            "q2_previous_3m": "20%",
+            "q3_previous_3m": "20%",
+            "q4_previous_3m": "20%",
+        },
+        "minimum_candles": 250,
+        "vnindex_in_formula": False,
+        "requested_symbols": RS_CACHE.get("requested_symbols", 0),
+        "successful_symbols": RS_CACHE.get("successful_symbols", 0),
+        "eligible_symbols": RS_CACHE.get("eligible_symbols", 0),
+        "empty_symbols": RS_CACHE.get("empty_symbols", 0),
+        "failed_symbols": RS_CACHE.get("failed_symbols", 0),
+        "elapsed_ms": RS_CACHE.get("elapsed_ms"),
+        "top_rs": RS_CACHE.get("rows", [])[:top_n],
+    }
+
+
 @app.get("/leaders")
 async def leaders(
     top_n: int = Query(
@@ -833,18 +1248,25 @@ async def leaders(
     ),
 ):
     """
-    Leader V2.
+    Leader V3.
 
-    Mục tiêu:
-    - Không chỉ xếp theo % tăng.
-    - Kết hợp tăng giá, thanh khoản, sức mạnh tương đối
-      so với VN-Index và sức mạnh của nhóm ngành.
-    - Gắn mỗi cổ phiếu với nhóm ngành.
-    - Có bộ lọc giá/thanh khoản mặc định phù hợp với
-      nguyên tắc sàng lọc của Investment OS.
-    - Chỉ cung cấp dữ liệu và điểm số minh bạch;
-      ORCHESTRATOR/Decision Engine mới đưa ra kết luận đầu tư.
+    Locked formula:
+      RS Rating O'Neil 40%
+      Liquidity percentile 30%
+      Group strength 30%
+
+    RS must already exist in RS_CACHE. No VN-Index comparison is used
+    in the RS component.
     """
+    if RS_CACHE.get("status") not in ("OK", "PARTIAL"):
+        return {
+            "source": "Investment OS",
+            "status": "DATA_INSUFFICIENT",
+            "version": "LEADER_V3",
+            "reason": "O'Neil RS cache is not ready",
+            "next": "Run /rs-refresh and wait for /rs-status",
+        }
+
     data = await _load_vci_stock_prices()
 
     if "error" in data:
@@ -854,75 +1276,23 @@ async def leaders(
             "error": data["error"],
         }
 
-    # ---------------------------------------------------------
-    # 1. Load VN-Index data for relative-strength comparison.
-    # ---------------------------------------------------------
-    try:
-        vnindex_daily = await fetch_dnse_ohlcv(
-            symbol="VNINDEX",
-            market="index",
-            resolution="1D",
-            days=30,
-        )
-
-        vnindex_daily = sorted(
-            vnindex_daily,
-            key=lambda x: x.get("time", 0),
-        )
-
-        if len(vnindex_daily) >= 2:
-            vnindex_last = _float(vnindex_daily[-1].get("close"))
-            vnindex_prev = _float(vnindex_daily[-2].get("close"))
-
-            if vnindex_prev > 0:
-                vnindex_change_pct = round(
-                    (vnindex_last / vnindex_prev - 1) * 100,
-                    2,
-                )
-            else:
-                vnindex_change_pct = 0.0
-        else:
-            vnindex_change_pct = 0.0
-
-        market_data_status = "OK"
-
-    except Exception as exc:
-        vnindex_change_pct = 0.0
-        market_data_status = "ERROR"
-        market_data_error = str(exc)
-
-    if market_data_status == "OK":
-        market_data_error = None
-
-    # ---------------------------------------------------------
-    # 2. Load ICB level-2 mapping.
-    # ---------------------------------------------------------
     async with httpx.AsyncClient(timeout=30) as client:
         icb = await _load_vci_icb_mapping(client, level=2)
 
     mapping = icb["mapping"]
 
-    # Build symbol -> ICB code from getAll universe.
     symbol_to_code = {}
-
     for item in data.get("universe_items", []):
         if not isinstance(item, dict):
             continue
-
         symbol = item.get("symbol")
         code = _extract_icb_code(item)
-
         if symbol and code:
             symbol_to_code[str(symbol).upper()] = code
 
-    # ---------------------------------------------------------
-    # 3. Parse current stock board once.
-    # ---------------------------------------------------------
     stocks = []
-
     for item in data["prices"]:
         row = _extract_stock_row(item)
-
         if not row:
             continue
 
@@ -930,181 +1300,98 @@ async def leaders(
         code = symbol_to_code.get(symbol)
 
         if code:
-            group_name = mapping.get(code)
-
-            if group_name:
-                mapping_source = "VCI_ICB"
-            else:
-                group_name = f"ICB {code}"
-                mapping_source = "ICB_CODE_FALLBACK"
+            group_name = mapping.get(code) or f"ICB {code}"
         else:
             group_name = "UNKNOWN"
-            code = None
-            mapping_source = "UNMAPPED"
 
         row["symbol"] = symbol
         row["icb_code"] = code
         row["group"] = group_name
-        row["mapping_source"] = mapping_source
-
-        row["rs_vs_vnindex_pct"] = round(
-            row["change_pct"] - vnindex_change_pct,
-            2,
-        )
-
         stocks.append(row)
 
-    # ---------------------------------------------------------
-    # 4. Group breadth from the same price-board snapshot.
-    # ---------------------------------------------------------
+    # Group breadth score from current cross-section.
     group_stats = {}
-
     for stock in stocks:
         group = stock["group"]
-
-        if group not in group_stats:
-            group_stats[group] = {
-                "group": group,
-                "icb_code": stock["icb_code"],
+        stats = group_stats.setdefault(
+            group,
+            {
                 "stocks": 0,
                 "advances": 0,
                 "declines": 0,
-                "unchanged": 0,
-            }
-
-        stats = group_stats[group]
+            },
+        )
         stats["stocks"] += 1
-
         if stock["change_pct"] > 0:
             stats["advances"] += 1
         elif stock["change_pct"] < 0:
             stats["declines"] += 1
-        else:
-            stats["unchanged"] += 1
 
     for stats in group_stats.values():
-        stocks_count = stats["stocks"]
+        count = stats["stocks"]
+        stats["breadth_score"] = (
+            (stats["advances"] - stats["declines"]) / count * 100
+            if count else 0.0
+        )
+        # Normalize -100..+100 to 0..100.
+        stats["group_score"] = max(
+            0.0,
+            min(100.0, (stats["breadth_score"] + 100) / 2),
+        )
 
-        stats["advance_ratio"] = round(
-            stats["advances"] / stocks_count * 100,
-            2,
-        ) if stocks_count else 0
-
-        stats["decline_ratio"] = round(
-            stats["declines"] / stocks_count * 100,
-            2,
-        ) if stocks_count else 0
-
-        stats["breadth_score"] = round(
-            (
-                stats["advances"] - stats["declines"]
-            ) / stocks_count * 100,
-            2,
-        ) if stocks_count else 0
-
-    # ---------------------------------------------------------
-    # 5. Volume percentile.
-    # ---------------------------------------------------------
-    positive_volume_stocks = sorted(
-        [
-            stock for stock in stocks
-            if stock["volume"] > 0
-        ],
+    # Liquidity percentile from current session volume.
+    volume_stocks = sorted(
+        [stock for stock in stocks if stock["volume"] > 0],
         key=lambda x: x["volume"],
     )
+    volume_count = len(volume_stocks)
+    volume_score = {}
 
-    volume_count = len(positive_volume_stocks)
-    volume_rank_map = {}
-
-    for rank, stock in enumerate(
-        positive_volume_stocks,
-        start=1,
-    ):
+    for rank, stock in enumerate(volume_stocks, start=1):
         if volume_count <= 1:
             percentile = 100.0
         else:
-            percentile = round(
-                (rank - 1) / (volume_count - 1) * 100,
-                2,
+            percentile = (
+                (rank - 1) / (volume_count - 1) * 100
             )
+        volume_score[stock["symbol"]] = percentile
 
-        volume_rank_map[stock["symbol"]] = {
-            "rank": rank,
-            "percentile": percentile,
-        }
-
-    # ---------------------------------------------------------
-    # 6. Leader score.
-    #
-    # Score components:
-    # - price strength:        0-40
-    # - volume percentile:    0-25
-    # - relative strength:    0-20
-    # - group breadth:        0-15
-    #
-    # Total: 0-100
-    # ---------------------------------------------------------
+    rs_map = RS_CACHE.get("by_symbol", {})
     eligible = []
 
     for stock in stocks:
+        rs_row = rs_map.get(stock["symbol"])
+        if not rs_row:
+            continue
+
+        liquidity_score = volume_score.get(stock["symbol"], 0.0)
         group = group_stats.get(stock["group"], {})
+        group_score = group.get("group_score", 0.0)
+        rs_rating = rs_row["rs_rating"]
 
-        volume_info = volume_rank_map.get(
-            stock["symbol"],
-            {
-                "rank": None,
-                "percentile": 0.0,
-            },
+        # Normalize 1..99 RS rating to 0..100 before applying 40%.
+        rs_score_100 = (rs_rating - 1) / 98 * 100
+
+        leader_score = (
+            0.40 * rs_score_100
+            + 0.30 * liquidity_score
+            + 0.30 * group_score
         )
 
-        # Price strength:
-        # 0 at <= 0%; 40 at >= +5%.
-        price_component = min(
-            max(stock["change_pct"], 0) / 5 * 40,
-            40,
-        )
-
-        volume_component = (
-            volume_info["percentile"] / 100 * 25
-        )
-
-        # Relative strength:
-        # 0 at <= 0%; 20 at >= +5% versus VN-Index.
-        rs_component = min(
-            max(stock["rs_vs_vnindex_pct"], 0) / 5 * 20,
-            20,
-        )
-
-        # Group breadth:
-        # 0 at <= -25; 15 at >= +25.
-        breadth_component = min(
-            max(
-                (group.get("breadth_score", -100) + 25)
-                / 50
-                * 15,
-                0,
-            ),
-            15,
-        )
-
-        leader_score = round(
-            price_component
-            + volume_component
-            + rs_component
-            + breadth_component,
+        stock["rs_rating"] = rs_rating
+        stock["rs_percentile"] = rs_row["rs_percentile"]
+        stock["p_score"] = rs_row["p_score"]
+        stock["q1_3m_pct"] = rs_row["q1_3m_pct"]
+        stock["q2_prev_3m_pct"] = rs_row["q2_prev_3m_pct"]
+        stock["q3_prev_3m_pct"] = rs_row["q3_prev_3m_pct"]
+        stock["q4_prev_3m_pct"] = rs_row["q4_prev_3m_pct"]
+        stock["liquidity_score"] = round(liquidity_score, 2)
+        stock["group_breadth_score"] = round(
+            group.get("breadth_score", 0.0),
             2,
         )
-
-        stock["volume_rank"] = volume_info["rank"]
-        stock["volume_percentile"] = volume_info["percentile"]
-        stock["group_breadth_score"] = group.get(
-            "breadth_score",
-            0,
-        )
-        stock["leader_score"] = leader_score
-
-        # Investment OS default screening:
-        # price > 10,000 and session volume > 100,000.
+        stock["group_score"] = round(group_score, 2)
+        stock["leader_score"] = round(leader_score, 2)
         stock["eligible_default"] = (
             stock["price"] >= min_price
             and stock["volume"] >= min_volume
@@ -1113,114 +1400,63 @@ async def leaders(
         if stock["eligible_default"]:
             eligible.append(stock)
 
-    # ---------------------------------------------------------
-    # 7. Rank eligible leaders.
-    # ---------------------------------------------------------
     eligible.sort(
         key=lambda x: (
             x["leader_score"],
-            x["change_pct"],
-            x["rs_vs_vnindex_pct"],
-            x["volume"],
+            x["rs_rating"],
+            x["liquidity_score"],
         ),
         reverse=True,
     )
 
-    top_leaders = eligible[:top_n]
-
-    # Secondary lists help ORCHESTRATOR explain why a stock
-    # appears on the leader board.
-    top_gainers = sorted(
-        eligible,
-        key=lambda x: (
-            x["change_pct"],
-            x["volume"],
-        ),
-        reverse=True,
-    )[:top_n]
-
-    top_volume = sorted(
-        eligible,
-        key=lambda x: x["volume"],
-        reverse=True,
-    )[:top_n]
-
-    top_rs = sorted(
-        eligible,
-        key=lambda x: (
-            x["rs_vs_vnindex_pct"],
-            x["change_pct"],
-        ),
-        reverse=True,
-    )[:top_n]
-
-    def _compact(stock):
+    def compact(stock):
         return {
             "symbol": stock["symbol"],
             "price": stock["price"],
             "change_pct": stock["change_pct"],
-            "rs_vs_vnindex_pct": stock["rs_vs_vnindex_pct"],
             "volume": stock["volume"],
-            "volume_rank": stock["volume_rank"],
-            "volume_percentile": stock["volume_percentile"],
             "group": stock["group"],
             "icb_code": stock["icb_code"],
+            "rs_rating": stock["rs_rating"],
+            "rs_percentile": stock["rs_percentile"],
+            "p_score": stock["p_score"],
+            "q1_3m_pct": stock["q1_3m_pct"],
+            "q2_prev_3m_pct": stock["q2_prev_3m_pct"],
+            "q3_prev_3m_pct": stock["q3_prev_3m_pct"],
+            "q4_prev_3m_pct": stock["q4_prev_3m_pct"],
+            "liquidity_score": stock["liquidity_score"],
             "group_breadth_score": stock["group_breadth_score"],
+            "group_score": stock["group_score"],
             "leader_score": stock["leader_score"],
-            "eligible_default": stock["eligible_default"],
             "volume_source": stock["volume_source"],
         }
 
     return {
-        "source": "VCI",
+        "source": "VCI + DNSE",
         "status": "OK",
-        "version": "2.0",
+        "version": "LEADER_V3",
+        "weights": {
+            "rs_rating": 0.40,
+            "liquidity": 0.30,
+            "group_strength": 0.30,
+        },
+        "rs_engine": {
+            "version": "RS_V3_ONEIL",
+            "eligible_symbols": RS_CACHE.get("eligible_symbols", 0),
+            "vnindex_in_formula": False,
+        },
         "screen": {
             "min_price": min_price,
             "min_volume": min_volume,
-            "top_n": top_n,
-            "default_rule": (
-                "price >= min_price AND "
-                "session_volume >= min_volume"
-            ),
         },
-        "market_reference": {
-            "symbol": "VNINDEX",
-            "change_pct": vnindex_change_pct,
-            "status": market_data_status,
-            "error": market_data_error,
-        },
-        "universe": len(data["symbols"]),
-        "total_batches": data["total_batches"],
-        "successful_batches": data["successful_batches"],
-        "failed_batches": data["failed_batches"],
         "priced_stocks": len(stocks),
-        "stocks_with_volume": sum(
-            1 for stock in stocks
-            if stock["volume"] > 0
-        ),
-        "eligible_stocks": len(eligible),
-        "icb_level": 2,
-        "mapping_status": icb["status"],
-        "mapping_rows": icb["rows"],
-        "mapping_error": icb["error"],
-        "groups_count": len(group_stats),
+        "eligible_leader_stocks": len(eligible),
         "top_leaders": [
-            _compact(stock)
-            for stock in top_leaders
+            compact(stock)
+            for stock in eligible[:top_n]
         ],
-        "top_gainers": [
-            _compact(stock)
-            for stock in top_gainers
-        ],
-        "top_volume": [
-            _compact(stock)
-            for stock in top_volume
-        ],
-        "top_rs_vs_vnindex": [
-            _compact(stock)
-            for stock in top_rs
-        ],
+        "mapping_status": icb["status"],
+        "mapping_error": icb["error"],
         "failed_batch_details": data["failed_batch_details"],
     }
 
