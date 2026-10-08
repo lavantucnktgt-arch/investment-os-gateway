@@ -4,7 +4,7 @@ import time
 import httpx
 
 from adapters.dnse import fetch_dnse_ohlcv
-	
+
 
 app = FastAPI(
     title="Investment OS Data Gateway",
