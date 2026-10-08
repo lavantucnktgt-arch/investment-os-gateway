@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Query, BackgroundTasks
+from fastapi import FastAPI, Query
 import asyncio
 import time
 import json
@@ -10,7 +10,7 @@ from adapters.dnse import fetch_dnse_ohlcv
 
 app = FastAPI(
     title="Investment OS Data Gateway",
-    version="5.0.0",
+    version="6.0.0",
 )
 
 
@@ -30,7 +30,7 @@ VCI_HEADERS = {
     "Origin": "https://trading.vietcap.com.vn",
 }
 
-RS_CHECKPOINT_PATH = Path("rs_batch_v2_checkpoint.json")
+RS_CHECKPOINT_PATH = Path("rs_batch_v3_checkpoint.json")
 
 
 def _save_rs_checkpoint(all_results):
@@ -1451,34 +1451,34 @@ def _build_rs_rows(all_results):
     return _assign_rs_ratings(eligible_rows)
 
 
-async def _refresh_rs_cache(
-    days=600,
-    concurrency=8,
-    limit=100,
-    batch_size=50,
-):
-    """
-    Run RS history in explicit batches with in-memory checkpoints.
 
-    The run is intentionally sequential by batch: each batch has limited
-    concurrent DNSE requests, then progress/checkpoint state is updated before
-    the next batch begins. Final RS percentile/rating is calculated only after
-    all requested symbols finish.
-    """
+async def _initialize_rs_batch_run(days=600, concurrency=8, limit=100, batch_size=50):
+    """Initialize a manual, request-driven RS Batch V3 run."""
     global RS_CACHE
 
-    if RS_CACHE.get("status") == "RUNNING":
-        return
+    universe = await _load_vci_symbols_only()
+    if "error" in universe:
+        raise RuntimeError(universe["error"])
 
-    started = time.perf_counter()
+    symbols = universe.get("symbols", [])
+    if limit and limit > 0:
+        symbols = symbols[:limit]
+
+    if not symbols:
+        raise RuntimeError("No eligible stock symbols found")
+
+    batches = [
+        symbols[i:i + batch_size]
+        for i in range(0, len(symbols), batch_size)
+    ]
 
     RS_CACHE = {
-        "status": "RUNNING",
+        "status": "READY_FOR_BATCH",
         "ranking_status": "NOT_READY",
         "started_at": time.time(),
         "finished_at": None,
         "elapsed_ms": None,
-        "requested_symbols": 0,
+        "requested_symbols": len(symbols),
         "processed_symbols": 0,
         "successful_symbols": 0,
         "eligible_symbols": 0,
@@ -1490,205 +1490,267 @@ async def _refresh_rs_cache(
         "batch_size": batch_size,
         "current_batch": 0,
         "completed_batches": 0,
-        "total_batches": 0,
+        "total_batches": len(batches),
         "last_batch_status": None,
         "checkpoint_saved_at": None,
-        "formula": {
-            "3m": 0.40,
-            "6m": 0.30,
-            "9m": 0.20,
-            "12m": 0.10,
-        },
+        "formula": {"3m": 0.40, "6m": 0.30, "9m": 0.20, "12m": 0.10},
         "minimum_candles": 251,
+        "symbols": symbols,
         "rows": [],
         "by_symbol": {},
         "errors": [],
         "history_counts": [],
+        "results": [],
     }
 
-    all_results = []
+    if not _save_rs_checkpoint([]):
+        raise RuntimeError("Could not save RS checkpoint")
+
+    RS_CACHE["checkpoint_saved_at"] = time.time()
+    return batches
+
+
+def _restore_rs_checkpoint():
+    """Restore the manual batch state from the local checkpoint if available."""
+    global RS_CACHE
+    if not RS_CHECKPOINT_PATH.exists():
+        return False
+    try:
+        payload = json.loads(RS_CHECKPOINT_PATH.read_text(encoding="utf-8"))
+        cache = payload.get("cache") or {}
+        results = payload.get("results") or []
+        RS_CACHE.update(cache)
+        RS_CACHE["results"] = results
+        partial_rows = _build_rs_rows(results)
+        RS_CACHE["rows"] = partial_rows
+        RS_CACHE["by_symbol"] = {row["symbol"]: row for row in partial_rows}
+        return True
+    except Exception:
+        return False
+
+
+async def _process_rs_batch(batch_number: int):
+    """Process exactly one RS history batch in one HTTP request."""
+    global RS_CACHE
+
+    if RS_CACHE.get("requested_symbols", 0) == 0:
+        if not _restore_rs_checkpoint():
+            return {"status": "EMPTY", "message": "Run /rs-refresh first"}
+
+    total_batches = RS_CACHE.get("total_batches", 0)
+    if batch_number < 1 or batch_number > total_batches:
+        return {
+            "status": "ERROR",
+            "message": f"batch must be between 1 and {total_batches}",
+        }
+
+    completed = RS_CACHE.get("completed_batches", 0)
+    if batch_number <= completed:
+        return {
+            "status": "ALREADY_DONE",
+            "batch": batch_number,
+            "completed_batches": completed,
+            "total_batches": total_batches,
+        }
+
+    if batch_number != completed + 1:
+        return {
+            "status": "ERROR",
+            "message": f"Next batch must be {completed + 1}",
+            "completed_batches": completed,
+            "requested_batch": batch_number,
+        }
+
+    symbols = RS_CACHE.get("symbols", [])
+    start = (batch_number - 1) * RS_CACHE["batch_size"]
+    end = min(start + RS_CACHE["batch_size"], len(symbols))
+    batch = symbols[start:end]
+
+    started = time.perf_counter()
+    RS_CACHE["status"] = "RUNNING_BATCH"
+    RS_CACHE["current_batch"] = batch_number
+    RS_CACHE["last_batch_status"] = "RUNNING"
 
     try:
-        universe = await _load_vci_symbols_only()
-
-        if "error" in universe:
-            RS_CACHE["status"] = "ERROR"
-            RS_CACHE["ranking_status"] = "ERROR"
-            RS_CACHE["errors"] = [universe["error"]]
-            return
-
-        symbols = universe.get("symbols", [])
-        if limit and limit > 0:
-            symbols = symbols[:limit]
-
-        RS_CACHE["requested_symbols"] = len(symbols)
-
-        if not symbols:
-            RS_CACHE["status"] = "ERROR"
-            RS_CACHE["ranking_status"] = "ERROR"
-            RS_CACHE["errors"] = ["No eligible stock symbols found"]
-            return
-
-        batches = [
-            symbols[i:i + batch_size]
-            for i in range(0, len(symbols), batch_size)
-        ]
-        RS_CACHE["total_batches"] = len(batches)
-
-        for batch_number, batch in enumerate(batches, start=1):
-            RS_CACHE["current_batch"] = batch_number
-            RS_CACHE["last_batch_status"] = "RUNNING"
-
-            results = await _load_rs_history_batch(
-                symbols=batch,
-                days=days,
-                concurrency=concurrency,
-            )
-            all_results.extend(results)
-
-            RS_CACHE["processed_symbols"] = len(all_results)
-            RS_CACHE["completed_batches"] = batch_number
-            RS_CACHE["last_batch_status"] = "OK"
-            checkpoint_ok = _save_rs_checkpoint(all_results)
-            RS_CACHE["checkpoint_saved_at"] = (
-                time.time() if checkpoint_ok else None
-            )
-
-            RS_CACHE["successful_symbols"] = sum(
-                1 for item in all_results
-                if item.get("status") in (
-                    "ELIGIBLE",
-                    "INSUFFICIENT_HISTORY",
-                )
-            )
-            RS_CACHE["eligible_symbols"] = sum(
-                1 for item in all_results
-                if item.get("status") == "ELIGIBLE"
-            )
-            RS_CACHE["empty_symbols"] = sum(
-                1 for item in all_results
-                if item.get("status") == "EMPTY"
-            )
-            RS_CACHE["insufficient_history_symbols"] = sum(
-                1 for item in all_results
-                if item.get("status") == "INSUFFICIENT_HISTORY"
-            )
-            RS_CACHE["failed_symbols"] = sum(
-                1 for item in all_results
-                if item.get("status") == "ERROR"
-            )
-            RS_CACHE["history_counts"] = [
-                item["count"]
-                for item in all_results
-                if item.get("count", 0) > 0
-            ]
-
-            # Monitoring ranking only; final percentile is recomputed after
-            # the final batch, using the complete eligible cross-section.
-            partial_rows = _build_rs_rows(all_results)
-            RS_CACHE["rows"] = partial_rows
-            RS_CACHE["by_symbol"] = {
-                row["symbol"]: row for row in partial_rows
-            }
-            RS_CACHE["ranking_status"] = (
-                "FINAL" if batch_number == len(batches) else "PARTIAL"
-            )
-
-            await asyncio.sleep(0)
-
-        RS_CACHE["errors"] = [
-            {
-                "symbol": item["symbol"],
-                "error": item.get("error"),
-            }
-            for item in all_results
-            if item.get("status") == "ERROR"
-        ][:50]
-
-        # Authoritative final ranking over the complete eligible universe.
-        final_rows = _build_rs_rows(all_results)
-        RS_CACHE["rows"] = final_rows
-        RS_CACHE["by_symbol"] = {
-            row["symbol"]: row for row in final_rows
-        }
-        RS_CACHE["eligible_symbols"] = len(final_rows)
-        RS_CACHE["ranking_status"] = "FINAL"
-        RS_CACHE["status"] = (
-            "OK" if RS_CACHE["failed_symbols"] == 0 else "PARTIAL"
+        results = await _load_rs_history_batch(
+            symbols=batch,
+            days=RS_CACHE["days"],
+            concurrency=RS_CACHE["concurrency"],
         )
+        all_results = list(RS_CACHE.get("results", []))
+        all_results.extend(results)
+        RS_CACHE["results"] = all_results
+        RS_CACHE["processed_symbols"] = len(all_results)
+        RS_CACHE["completed_batches"] = batch_number
+        RS_CACHE["last_batch_status"] = "OK"
+        RS_CACHE["successful_symbols"] = sum(
+            1 for item in all_results
+            if item.get("status") in ("ELIGIBLE", "INSUFFICIENT_HISTORY")
+        )
+        RS_CACHE["eligible_symbols"] = sum(
+            1 for item in all_results if item.get("status") == "ELIGIBLE"
+        )
+        RS_CACHE["empty_symbols"] = sum(
+            1 for item in all_results if item.get("status") == "EMPTY"
+        )
+        RS_CACHE["insufficient_history_symbols"] = sum(
+            1 for item in all_results
+            if item.get("status") == "INSUFFICIENT_HISTORY"
+        )
+        RS_CACHE["failed_symbols"] = sum(
+            1 for item in all_results if item.get("status") == "ERROR"
+        )
+        RS_CACHE["history_counts"] = [
+            item["count"] for item in all_results if item.get("count", 0) > 0
+        ]
+        RS_CACHE["rows"] = _build_rs_rows(all_results)
+        RS_CACHE["by_symbol"] = {
+            row["symbol"]: row for row in RS_CACHE["rows"]
+        }
+        RS_CACHE["status"] = (
+            "BATCH_COMPLETE" if batch_number < total_batches else "ALL_BATCHES_COMPLETE"
+        )
+        RS_CACHE["ranking_status"] = (
+            "PARTIAL" if batch_number < total_batches else "READY_TO_FINALIZE"
+        )
+        RS_CACHE["errors"] = [
+            {"symbol": item["symbol"], "error": item.get("error")}
+            for item in all_results if item.get("status") == "ERROR"
+        ][:50]
+        RS_CACHE["checkpoint_saved_at"] = time.time()
+        if not _save_rs_checkpoint(all_results):
+            RS_CACHE["last_batch_status"] = "CHECKPOINT_FAILED"
+            RS_CACHE["errors"].append({"error": "Checkpoint save failed"})
 
+        batch_elapsed = round((time.perf_counter() - started) * 1000, 1)
+        next_batch = batch_number + 1 if batch_number < total_batches else None
+        return {
+            "status": RS_CACHE["status"],
+            "batch": batch_number,
+            "batch_symbols": len(batch),
+            "processed_symbols": RS_CACHE["processed_symbols"],
+            "requested_symbols": RS_CACHE["requested_symbols"],
+            "progress_pct": round(
+                RS_CACHE["processed_symbols"] / RS_CACHE["requested_symbols"] * 100, 2
+            ),
+            "completed_batches": batch_number,
+            "total_batches": total_batches,
+            "eligible_symbols": RS_CACHE["eligible_symbols"],
+            "insufficient_history_symbols": RS_CACHE["insufficient_history_symbols"],
+            "empty_symbols": RS_CACHE["empty_symbols"],
+            "failed_symbols": RS_CACHE["failed_symbols"],
+            "batch_elapsed_ms": batch_elapsed,
+            "next_batch": next_batch,
+            "next_action": (
+                f"Call /rs-batch?batch={next_batch}"
+                if next_batch else "Call /rs-finalize"
+            ),
+        }
     except Exception as exc:
         RS_CACHE["status"] = "ERROR"
-        RS_CACHE["ranking_status"] = "ERROR"
         RS_CACHE["last_batch_status"] = "ERROR"
         RS_CACHE["errors"] = [str(exc)]
-
-    finally:
-        RS_CACHE["finished_at"] = time.time()
-        RS_CACHE["elapsed_ms"] = round(
-            (time.perf_counter() - started) * 1000,
-            1,
-        )
+        return {
+            "status": "ERROR",
+            "batch": batch_number,
+            "error": str(exc),
+        }
 
 
 @app.get("/rs-refresh")
 async def rs_refresh(
-    background_tasks: BackgroundTasks,
-    days: int = Query(
-        600, ge=400, le=900,
-        description="Ngày lịch sử DNSE; mặc định 600",
-    ),
-    concurrency: int = Query(
-        8, ge=1, le=12,
-        description="Số request DNSE đồng thời",
-    ),
-    limit: int = Query(
-        100, ge=0, le=2000,
-        description="Mặc định 100 mã; 0 = toàn bộ universe",
-    ),
-    batch_size: int = Query(
-        50, ge=25, le=100,
-        description="Số mã mỗi batch",
-    ),
+    days: int = Query(600, ge=400, le=900),
+    concurrency: int = Query(8, ge=1, le=12),
+    limit: int = Query(100, ge=0, le=2000),
+    batch_size: int = Query(50, ge=25, le=100),
 ):
-    """Start the checkpointed RS Batch V2 engine."""
-    if RS_CACHE.get("status") == "RUNNING":
+    """Initialize RS Batch V3; does not run history in the background."""
+    try:
+        batches = await _initialize_rs_batch_run(
+            days=days,
+            concurrency=concurrency,
+            limit=limit,
+            batch_size=batch_size,
+        )
         return {
-            "status": "RUNNING",
-            "message": "RS Batch V2 is already running",
-            "requested_symbols": RS_CACHE.get("requested_symbols", 0),
-            "processed_symbols": RS_CACHE.get("processed_symbols", 0),
-            "current_batch": RS_CACHE.get("current_batch", 0),
+            "status": "STARTED",
+            "engine": "RS Batch V3 - one HTTP request per batch",
+            "formula": {
+                "3m": "40% × % price change in latest ~63 sessions",
+                "6m": "30% × % price change in latest ~126 sessions",
+                "9m": "20% × % price change in latest ~189 sessions",
+                "12m": "10% × % price change in latest ~250 sessions",
+            },
+            "minimum_candles": 251,
+            "vnindex_in_formula": False,
+            "requested_symbols": RS_CACHE["requested_symbols"],
+            "batch_size": batch_size,
+            "total_batches": len(batches),
+            "next": "Call /rs-batch?batch=1",
+        }
+    except Exception as exc:
+        return {"status": "ERROR", "error": str(exc)}
+
+
+@app.get("/rs-batch")
+async def rs_batch(
+    batch: int = Query(1, ge=1, description="Batch number, starting at 1"),
+):
+    """Process exactly one RS batch and return the next batch to call."""
+    return await _process_rs_batch(batch)
+
+
+@app.get("/rs-finalize")
+async def rs_finalize():
+    """Finalize the complete cross-sectional RS 1-99 ranking."""
+    global RS_CACHE
+
+    if RS_CACHE.get("requested_symbols", 0) == 0:
+        if not _restore_rs_checkpoint():
+            return {"status": "EMPTY", "message": "Run /rs-refresh first"}
+
+    if RS_CACHE.get("completed_batches", 0) != RS_CACHE.get("total_batches", 0):
+        return {
+            "status": "NOT_READY",
             "completed_batches": RS_CACHE.get("completed_batches", 0),
             "total_batches": RS_CACHE.get("total_batches", 0),
+            "next_batch": RS_CACHE.get("completed_batches", 0) + 1,
         }
 
-    background_tasks.add_task(
-        _refresh_rs_cache,
-        days, concurrency, limit, batch_size,
+    started = time.perf_counter()
+    all_results = RS_CACHE.get("results", [])
+    final_rows = _build_rs_rows(all_results)
+    RS_CACHE["rows"] = final_rows
+    RS_CACHE["by_symbol"] = {row["symbol"]: row for row in final_rows}
+    RS_CACHE["eligible_symbols"] = len(final_rows)
+    RS_CACHE["ranking_status"] = "FINAL"
+    RS_CACHE["status"] = "OK" if RS_CACHE["failed_symbols"] == 0 else "PARTIAL"
+    RS_CACHE["finished_at"] = time.time()
+    RS_CACHE["elapsed_ms"] = round(
+        (time.perf_counter() - started) * 1000, 1
     )
+    RS_CACHE["checkpoint_saved_at"] = time.time()
+    _save_rs_checkpoint(all_results)
 
     return {
-        "status": "STARTED",
-        "engine": "RS Batch V2",
-        "formula": {
-            "3m": "40% × % price change in latest ~63 sessions",
-            "6m": "30% × % price change in latest ~126 sessions",
-            "9m": "20% × % price change in latest ~189 sessions",
-            "12m": "10% × % price change in latest ~250 sessions",
-        },
-        "minimum_candles": 251,
-        "vnindex_in_formula": False,
-        "days": days,
-        "concurrency": concurrency,
-        "limit": limit,
-        "batch_size": batch_size,
-        "next": "Check /rs-status",
+        "status": RS_CACHE["status"],
+        "ranking_status": "FINAL",
+        "requested_symbols": RS_CACHE["requested_symbols"],
+        "processed_symbols": RS_CACHE["processed_symbols"],
+        "eligible_symbols": RS_CACHE["eligible_symbols"],
+        "failed_symbols": RS_CACHE["failed_symbols"],
+        "completed_batches": RS_CACHE["completed_batches"],
+        "total_batches": RS_CACHE["total_batches"],
+        "elapsed_ms": RS_CACHE["elapsed_ms"],
+        "next": "Call /rs?top_n=50",
     }
 
 
 @app.get("/rs-status")
 async def rs_status():
+    if RS_CACHE.get("requested_symbols", 0) == 0:
+        _restore_rs_checkpoint()
+
     processed = RS_CACHE.get("processed_symbols", 0)
     requested = RS_CACHE.get("requested_symbols", 0)
 
@@ -1723,71 +1785,47 @@ async def rs_status():
 @app.get("/rs-reset")
 async def rs_reset():
     global RS_CACHE
-    if RS_CACHE.get("status") == "RUNNING":
-        return {
-            "status": "RUNNING",
-            "message": "Cannot reset while RS Batch V2 is running",
-        }
+    if RS_CACHE.get("status") in ("RUNNING_BATCH",):
+        return {"status": "RUNNING", "message": "Cannot reset while a batch is running"}
     try:
         RS_CHECKPOINT_PATH.unlink(missing_ok=True)
     except Exception:
         pass
     RS_CACHE = {
-        "status": "EMPTY",
-        "ranking_status": "NOT_READY",
-        "started_at": None,
-        "finished_at": None,
-        "elapsed_ms": None,
-        "requested_symbols": 0,
-        "processed_symbols": 0,
-        "successful_symbols": 0,
-        "eligible_symbols": 0,
-        "empty_symbols": 0,
-        "insufficient_history_symbols": 0,
-        "failed_symbols": 0,
-        "days": 600,
-        "concurrency": 8,
-        "batch_size": 50,
-        "current_batch": 0,
-        "completed_batches": 0,
-        "total_batches": 0,
-        "last_batch_status": None,
+        "status": "EMPTY", "ranking_status": "NOT_READY", "started_at": None,
+        "finished_at": None, "elapsed_ms": None, "requested_symbols": 0,
+        "processed_symbols": 0, "successful_symbols": 0, "eligible_symbols": 0,
+        "empty_symbols": 0, "insufficient_history_symbols": 0, "failed_symbols": 0,
+        "days": 600, "concurrency": 8, "batch_size": 50, "current_batch": 0,
+        "completed_batches": 0, "total_batches": 0, "last_batch_status": None,
         "checkpoint_saved_at": None,
         "formula": {"3m": 0.40, "6m": 0.30, "9m": 0.20, "12m": 0.10},
-        "minimum_candles": 251,
-        "rows": [],
-        "by_symbol": {},
-        "errors": [],
-        "history_counts": [],
+        "minimum_candles": 251, "symbols": [], "rows": [], "by_symbol": {},
+        "errors": [], "history_counts": [], "results": [],
     }
-    return {"status": "RESET", "engine": "RS Batch V2"}
+    return {"status": "RESET", "engine": "RS Batch V3"}
 
 
 @app.get("/rs")
 async def rs_ranking(
     top_n: int = Query(50, ge=5, le=200, description="Số mã RS cao nhất trả về"),
 ):
-    """Return cached RS Batch V2 ranking."""
+    """Return cached final RS ranking."""
     status = RS_CACHE.get("status")
-    if status not in ("OK", "PARTIAL"):
+    if status not in ("OK", "PARTIAL") or RS_CACHE.get("ranking_status") != "FINAL":
         return {
             "status": status,
             "ranking_status": RS_CACHE.get("ranking_status"),
-            "message": "RS ranking is not ready. Run /rs-refresh and wait for /rs-status.",
+            "message": "RS ranking is not final. Complete all batches and call /rs-finalize.",
             "eligible_symbols": RS_CACHE.get("eligible_symbols", 0),
         }
 
     return {
         "source": "VCI universe + DNSE history",
         "status": status,
-        "ranking_status": RS_CACHE.get("ranking_status"),
-        "version": "RS_BATCH_V2",
-        "formula": {
-            "3m": "40%",
-            "6m": "30%",
-            "9m": "20%",
-            "12m": "10%",
-        },
+        "ranking_status": "FINAL",
+        "version": "RS_BATCH_V3",
+        "formula": {"3m": "40%", "6m": "30%", "9m": "20%", "12m": "10%"},
         "definition": {
             "3m": "% change in price over latest ~63 trading sessions",
             "6m": "% change in price over latest ~126 trading sessions",
@@ -1899,7 +1937,7 @@ async def rs_history_test(
     return {
         "source": "VCI + DNSE",
         "status": "OK" if not errors else "PARTIAL",
-        "purpose": "RS Batch V2 history benchmark; >250-session eligibility gate",
+        "purpose": "RS Batch V3 history benchmark; >250-session eligibility gate",
         "requested_symbols": len(symbols),
         "successful_symbols": len(successful),
         "empty_symbols": len(empty),
