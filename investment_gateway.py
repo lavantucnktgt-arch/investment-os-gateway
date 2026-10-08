@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Query
+from fastapi.responses import HTMLResponse
 import asyncio
 import time
 import json
@@ -10,7 +11,7 @@ from adapters.dnse import fetch_dnse_ohlcv
 
 app = FastAPI(
     title="Investment OS Data Gateway",
-    version="6.0.0",
+    version="7.0.0",
 )
 
 
@@ -30,7 +31,7 @@ VCI_HEADERS = {
     "Origin": "https://trading.vietcap.com.vn",
 }
 
-RS_CHECKPOINT_PATH = Path("rs_batch_v3_checkpoint.json")
+RS_CHECKPOINT_PATH = Path("rs_batch_v4_checkpoint.json")
 
 
 def _save_rs_checkpoint(all_results):
@@ -1781,6 +1782,123 @@ async def rs_status():
         "errors": RS_CACHE.get("errors", [])[:10],
     }
 
+
+
+@app.get("/rs-run-all", response_class=HTMLResponse)
+async def rs_run_all_page(
+    limit: int = Query(1522, ge=1, le=2000),
+    days: int = Query(600, ge=400, le=900),
+    concurrency: int = Query(8, ge=1, le=12),
+    batch_size: int = Query(50, ge=25, le=100),
+):
+    """One-link browser runner.
+
+    The browser sequentially calls the existing /rs-batch endpoint.
+    No long-running FastAPI background task is used.
+    Each batch remains a separate HTTP request, while this page orchestrates
+    the sequence in the browser and calls /rs-finalize at the end.
+    """
+    import html
+    params = {
+        "limit": limit,
+        "days": days,
+        "concurrency": concurrency,
+        "batch_size": batch_size,
+    }
+    title = "Investment OS - RS Batch V4 Run All"
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{html.escape(title)}</title>
+<style>
+body{{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Arial,sans-serif;margin:20px;line-height:1.45}}
+h2{{margin-bottom:8px}}
+#status{{white-space:pre-wrap;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:#f5f5f5;padding:14px;border-radius:10px}}
+progress{{width:100%;height:24px}}
+.small{{color:#666;font-size:14px}}
+</style>
+</head>
+<body>
+<h2>Investment OS — RS Batch V4</h2>
+<p class="small">Một link → tuần tự chạy từng batch → Finalize. Không dùng Background Task dài.</p>
+<progress id="bar" value="0" max="100"></progress>
+<p id="pct">0%</p>
+<div id="status">Đang chuẩn bị...</div>
+
+<script>
+const CFG = {json.dumps(params)};
+const out = document.getElementById("status");
+const bar = document.getElementById("bar");
+const pct = document.getElementById("pct");
+
+function show(x) {{
+  out.textContent = typeof x === "string" ? x : JSON.stringify(x, null, 2);
+}}
+
+async function getJSON(url) {{
+  const r = await fetch(url, {{cache:"no-store"}});
+  const text = await r.text();
+  let data;
+  try {{ data = JSON.parse(text); }}
+  catch(e) {{ throw new Error("HTTP " + r.status + ": " + text.slice(0,500)); }}
+  if (!r.ok) throw new Error("HTTP " + r.status + ": " + JSON.stringify(data));
+  return data;
+}}
+
+async function main() {{
+  try {{
+    let s = await getJSON("/rs-status");
+
+    const sameRun =
+      Number(s.requested_symbols || 0) === CFG.limit &&
+      Number(s.days || 0) === CFG.days &&
+      Number(s.batch_size || 0) === CFG.batch_size;
+
+    if (!sameRun || s.status === "EMPTY") {{
+      show("Đang khởi tạo RS Batch V4...");
+      s = await getJSON(
+        `/rs-refresh?limit=${{CFG.limit}}&days=${{CFG.days}}&concurrency=${{CFG.concurrency}}&batch_size=${{CFG.batch_size}}`
+      );
+      if (s.status !== "STARTED") throw new Error(JSON.stringify(s));
+    }} else if (s.ranking_status === "FINAL") {{
+      bar.value = 100; pct.textContent = "100%";
+      show(s);
+      return;
+    }}
+
+    let total = Number(s.total_batches || Math.ceil(CFG.limit / CFG.batch_size));
+    let next = Math.max(1, Number(s.completed_batches || 0) + 1);
+
+    for (let b = next; b <= total; b++) {{
+      show(`Đang xử lý batch ${{b}}/${{total}}...\\nKhông đóng trang.`);
+      const r = await getJSON(`/rs-batch?batch=${{b}}`);
+      const progress = Number(r.progress_pct || (b / total * 100));
+      bar.value = progress;
+      pct.textContent = progress.toFixed(1) + "%";
+      if (!["BATCH_COMPLETE","ALL_BATCHES_COMPLETE"].includes(r.status)) {{
+        throw new Error(JSON.stringify(r));
+      }}
+    }}
+
+    show("Các batch đã hoàn tất. Đang Finalize...");
+    const final = await getJSON("/rs-finalize");
+    bar.value = 100; pct.textContent = "100%";
+    show(final);
+
+    if (final.ranking_status === "FINAL") {{
+      out.textContent += "\\n\\nHOÀN TẤT. Mở /rs?top_n=50 để xem RS.";
+    }}
+  }} catch (e) {{
+    show("ERROR\\n" + e.message);
+  }}
+}}
+
+main();
+</script>
+</body>
+</html>"""
 
 @app.get("/rs-reset")
 async def rs_reset():
