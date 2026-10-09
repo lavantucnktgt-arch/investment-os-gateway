@@ -6,20 +6,20 @@ import time
 import json
 from pathlib import Path
 import httpx
-
+ 
 from adapters.dnse import fetch_dnse_ohlcv
-
-
+ 
+ 
 app = FastAPI(
     title="Investment OS Data Gateway",
     version="8.0.0",
 )
-
-
+ 
+ 
 VCI_SYMBOLS_URL = "https://trading.vietcap.com.vn/api/price/symbols/getAll"
 VCI_PRICE_URL = "https://trading.vietcap.com.vn/api/price/symbols/getList"
 VCI_ICB_URL = "https://iq.vietcap.com.vn/api/iq-insight-service/v1/sectors/icb-codes"
-
+ 
 VCI_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -31,10 +31,10 @@ VCI_HEADERS = {
     "Referer": "https://trading.vietcap.com.vn/",
     "Origin": "https://trading.vietcap.com.vn",
 }
-
+ 
 RS_CHECKPOINT_PATH = Path("rs_batch_v4_checkpoint.json")
-
-
+ 
+ 
 def _save_rs_checkpoint(all_results):
     """Save the current RS batch state to a local JSON checkpoint."""
     payload = {
@@ -54,70 +54,70 @@ def _save_rs_checkpoint(all_results):
         return True
     except Exception:
         return False
-
-
+ 
+ 
 def _float(value, default=0.0):
     try:
         return float(value)
     except (TypeError, ValueError):
         return default
-
-
+ 
+ 
 def _sma(values, period):
     if len(values) < period:
         return None
     return sum(values[-period:]) / period
-
-
+ 
+ 
 def _ema_series(values, period):
     if len(values) < period:
         return []
-
+ 
     seed = sum(values[:period]) / period
     result = [seed]
     multiplier = 2 / (period + 1)
     ema = seed
-
+ 
     for value in values[period:]:
         ema = (value - ema) * multiplier + ema
         result.append(ema)
-
+ 
     return result
-
-
+ 
+ 
 def _macd(values, fast=12, slow=26, signal=9):
     if len(values) < slow:
         return None, None, None
-
+ 
     slow_ema = _ema_series(values, slow)
     fast_ema = _ema_series(values, fast)
-
+ 
     if not slow_ema or not fast_ema:
         return None, None, None
-
+ 
     offset = len(fast_ema) - len(slow_ema)
     fast_aligned = fast_ema[offset:]
-
+ 
     macd_series = [
         fast_aligned[i] - slow_ema[i]
         for i in range(len(slow_ema))
     ]
-
+ 
     if len(macd_series) < signal:
         return None, None, None
-
+ 
     signal_series = _ema_series(macd_series, signal)
-
+ 
     if not signal_series:
         return None, None, None
-
+ 
     macd_value = macd_series[-1]
     signal_value = signal_series[-1]
     histogram = macd_value - signal_value
-
+ 
     return macd_value, signal_value, histogram
-
-
+ 
+ 
 def _market_snapshot(candles):
     if not candles:
         return {
@@ -131,17 +131,17 @@ def _market_snapshot(candles):
             "histogram": None,
             "data_points": 0,
         }
-
+ 
     candles = sorted(
         candles,
         key=lambda x: x.get("time", 0),
     )
-
+ 
     closes = [_float(x.get("close")) for x in candles]
     volumes = [_float(x.get("volume")) for x in candles]
-
+ 
     macd_value, signal_value, histogram = _macd(closes)
-
+ 
     return {
         "close": closes[-1],
         "ma20": _sma(closes, 20),
@@ -153,8 +153,8 @@ def _market_snapshot(candles):
         "histogram": histogram,
         "data_points": len(candles),
     }
-
-
+ 
+ 
 def _extract_volume(item):
     """
     VCI raw price-board data stores the session's accumulated
@@ -163,9 +163,9 @@ def _extract_volume(item):
     """
     if not isinstance(item, dict):
         return 0.0, "not_found"
-
+ 
     match = item.get("matchPrice") or {}
-
+ 
     if isinstance(match, dict):
         for key in (
             "accumulatedVolume",
@@ -180,12 +180,12 @@ def _extract_volume(item):
         ):
             if key not in match:
                 continue
-
+ 
             value = _float(match.get(key), -1)
-
+ 
             if value > 0:
                 return value, f"matchPrice.{key}"
-
+ 
     for key in (
         "accumulatedVolume",
         "accumulated_volume",
@@ -197,45 +197,45 @@ def _extract_volume(item):
     ):
         if key not in item:
             continue
-
+ 
         value = _float(item.get(key), -1)
-
+ 
         if value > 0:
             return value, key
-
+ 
     return 0.0, "not_found"
-
-
+ 
+ 
 def _extract_stock_row(item):
     if not isinstance(item, dict):
         return None
-
+ 
     listing = item.get("listingInfo") or {}
     match = item.get("matchPrice") or {}
-
+ 
     symbol = (
         listing.get("symbol")
         or listing.get("ticker")
         or item.get("symbol")
     )
-
+ 
     ref = _float(
         listing.get("refPrice")
         or listing.get("referencePrice")
         or listing.get("reference_price")
     )
-
+ 
     price = _float(
         match.get("matchPrice")
         or match.get("match_price")
         or item.get("matchPriceValue")
     )
-
+ 
     volume, volume_source = _extract_volume(item)
-
+ 
     if not symbol or ref <= 0 or price <= 0:
         return None
-
+ 
     return {
         "symbol": symbol,
         "price": price,
@@ -243,15 +243,15 @@ def _extract_stock_row(item):
         "volume": int(volume),
         "volume_source": volume_source,
     }
-
-
+ 
+ 
 async def _load_vci_stock_prices():
     async with httpx.AsyncClient(timeout=60) as client:
         universe_response = await client.get(
             VCI_SYMBOLS_URL,
             headers=VCI_HEADERS,
         )
-
+ 
         if not universe_response.is_success:
             return {
                 "error": (
@@ -259,90 +259,90 @@ async def _load_vci_stock_prices():
                     f"HTTP {universe_response.status_code}"
                 )
             }
-
+ 
         universe = universe_response.json()
-
+ 
         universe_items = universe if isinstance(universe, list) else (universe.get("data", []) if isinstance(universe, dict) else [])
-
+ 
         if isinstance(universe, dict):
             universe = universe.get("data", [])
-
+ 
         if not isinstance(universe, list):
             universe = []
-
+ 
         symbols = []
-
+ 
         for item in universe:
             if not isinstance(item, dict):
                 continue
-
+ 
             if item.get("type") != "STOCK":
                 continue
-
+ 
             if item.get("board") not in ["HSX", "HNX", "UPCOM"]:
                 continue
-
+ 
             symbol = item.get("symbol")
-
+ 
             if symbol:
                 symbols.append(symbol)
-
+ 
         symbols = list(dict.fromkeys(symbols))
-
+ 
         prices = []
         batch_size = 50
-
+ 
         total_batches = (
             len(symbols) + batch_size - 1
         ) // batch_size
-
+ 
         successful_batches = 0
         failed_batches = 0
         failed_batch_details = []
-
+ 
         for i in range(
             0,
             len(symbols),
             batch_size,
         ):
             batch = symbols[i:i + batch_size]
-
+ 
             try:
                 response = await client.post(
                     VCI_PRICE_URL,
                     headers=VCI_HEADERS,
                     json={"symbols": batch},
                 )
-
+ 
                 if not response.is_success:
                     failed_batches += 1
-
+ 
                     failed_batch_details.append({
                         "batch_start": i,
                         "status": response.status_code,
                     })
-
+ 
                     continue
-
+ 
                 data = response.json()
-
+ 
                 if isinstance(data, dict):
                     data = data.get("data", [])
-
+ 
                 if not isinstance(data, list):
                     data = []
-
+ 
                 prices.extend(data)
                 successful_batches += 1
-
+ 
             except Exception as exc:
                 failed_batches += 1
-
+ 
                 failed_batch_details.append({
                     "batch_start": i,
                     "error": str(exc),
                 })
-
+ 
     return {
         "symbols": symbols,
         "prices": prices,
@@ -352,10 +352,10 @@ async def _load_vci_stock_prices():
         "failed_batches": failed_batches,
         "failed_batch_details": failed_batch_details,
     }
-
-
-
-
+ 
+ 
+ 
+ 
 async def _load_vci_icb_mapping(client, level=2):
     """Load ICB code -> Vietnamese industry name mapping from VCI."""
     try:
@@ -363,7 +363,7 @@ async def _load_vci_icb_mapping(client, level=2):
             VCI_ICB_URL,
             headers=VCI_HEADERS,
         )
-
+ 
         if not response.is_success:
             return {
                 "status": "ERROR",
@@ -371,36 +371,36 @@ async def _load_vci_icb_mapping(client, level=2):
                 "mapping": {},
                 "rows": 0,
             }
-
+ 
         payload = response.json()
         rows = payload.get("data", []) if isinstance(payload, dict) else []
-
+ 
         if not isinstance(rows, list):
             rows = []
-
+ 
         mapping = {}
-
+ 
         for item in rows:
             if not isinstance(item, dict):
                 continue
-
+ 
             item_level = item.get("icbLevel")
             try:
                 item_level = int(item_level)
             except (TypeError, ValueError):
                 continue
-
+ 
             if item_level != level:
                 continue
-
+ 
             code = item.get("name")
             name = item.get("viSector") or item.get("enSector")
-
+ 
             if code is None or not name:
                 continue
-
+ 
             mapping[str(code).strip()] = str(name).strip()
-
+ 
         if not mapping:
             return {
                 "status": "ERROR",
@@ -408,14 +408,14 @@ async def _load_vci_icb_mapping(client, level=2):
                 "mapping": {},
                 "rows": len(rows),
             }
-
+ 
         return {
             "status": "OK",
             "error": None,
             "mapping": mapping,
             "rows": len(rows),
         }
-
+ 
     except Exception as exc:
         return {
             "status": "ERROR",
@@ -423,20 +423,20 @@ async def _load_vci_icb_mapping(client, level=2):
             "mapping": {},
             "rows": 0,
         }
-
-
+ 
+ 
 def _extract_icb_code(item):
     if not isinstance(item, dict):
         return None
-
+ 
     for key in ("icbCode2", "icb_code2", "icbCode"):
         value = item.get(key)
         if value is not None and str(value).strip():
             return str(value).strip()
-
+ 
     return None
-
-
+ 
+ 
 @app.get("/groups")
 async def groups(
     level: int = Query(
@@ -466,65 +466,65 @@ async def groups(
     - Keep the output factual; interpretation remains with ORCHESTRATOR.
     """
     data = await _load_vci_stock_prices()
-
+ 
     if "error" in data:
         return {
             "source": "VCI",
             "status": "ERROR",
             "error": data["error"],
         }
-
+ 
     async with httpx.AsyncClient(timeout=30) as client:
         icb = await _load_vci_icb_mapping(client, level=level)
-
+ 
     mapping = icb["mapping"]
     groups_data = {}
     mapped_symbols = 0
     unmapped_symbols = 0
-
+ 
     # Build symbol -> ICB code from the original getAll universe.
     universe_items = data.get("universe_items", [])
     symbol_to_code = {}
-
+ 
     for item in universe_items:
         if not isinstance(item, dict):
             continue
-
+ 
         symbol = item.get("symbol")
         code = _extract_icb_code(item)
-
+ 
         if symbol and code:
             symbol_to_code[str(symbol).upper()] = code
-
+ 
     # Parse price-board data once and attach each stock to its group.
     all_stocks = []
-
+ 
     for item in data["prices"]:
         row = _extract_stock_row(item)
-
+ 
         if not row:
             continue
-
+ 
         symbol = str(row["symbol"]).upper()
         code = symbol_to_code.get(symbol)
-
+ 
         if not code:
             unmapped_symbols += 1
             continue
-
+ 
         group_name = mapping.get(code)
         mapping_source = "VCI_ICB"
-
+ 
         if not group_name:
             group_name = f"ICB {code}"
             mapping_source = "ICB_CODE_FALLBACK"
-
+ 
         row["icb_code"] = code
         row["group"] = group_name
         row["mapping_source"] = mapping_source
         all_stocks.append(row)
         mapped_symbols += 1
-
+ 
         if group_name not in groups_data:
             groups_data[group_name] = {
                 "group": group_name,
@@ -539,56 +539,56 @@ async def groups(
                 "total_volume": 0,
                 "avg_change_pct_sum": 0.0,
             }
-
+ 
         group = groups_data[group_name]
         group["stocks"] += 1
         group["total_volume"] += row["volume"]
         group["avg_change_pct_sum"] += row["change_pct"]
-
+ 
         change_pct = row["change_pct"]
-
+ 
         if change_pct > 0:
             group["advances"] += 1
         elif change_pct < 0:
             group["declines"] += 1
         else:
             group["unchanged"] += 1
-
+ 
         if change_pct >= 5:
             group["strong_advances_5pct"] += 1
         elif change_pct <= -5:
             group["strong_declines_5pct"] += 1
-
+ 
         group["leaders"].append(row)
-
+ 
     result = []
-
+ 
     for group in groups_data.values():
         stocks = group["stocks"]
-
+ 
         group["advance_ratio"] = round(
             group["advances"] / stocks * 100,
             2,
         ) if stocks else 0
-
+ 
         group["decline_ratio"] = round(
             group["declines"] / stocks * 100,
             2,
         ) if stocks else 0
-
+ 
         group["breadth_score"] = round(
             (group["advances"] - group["declines"]) / stocks * 100,
             2,
         ) if stocks else 0
-
+ 
         group["avg_change_pct"] = round(
             group["avg_change_pct_sum"] / stocks,
             2,
         ) if stocks else 0
-
+ 
         group["volume_total"] = int(group.pop("total_volume", 0))
         group.pop("avg_change_pct_sum", None)
-
+ 
         # Leader ranking is deliberately simple and transparent:
         # price strength first, then traded volume.
         leaders = sorted(
@@ -599,7 +599,7 @@ async def groups(
             ),
             reverse=True,
         )[:leaders_per_group]
-
+ 
         group["leaders"] = [
             {
                 "symbol": stock["symbol"],
@@ -609,7 +609,7 @@ async def groups(
             }
             for stock in leaders
         ]
-
+ 
         if group["breadth_score"] >= 25:
             group["strength"] = "STRONG"
         elif group["breadth_score"] >= 10:
@@ -620,9 +620,9 @@ async def groups(
             group["strength"] = "NEGATIVE"
         else:
             group["strength"] = "NEUTRAL"
-
+ 
         result.append(group)
-
+ 
     # Rank groups by breadth first, then average price change.
     result.sort(
         key=lambda x: (
@@ -633,15 +633,15 @@ async def groups(
         ),
         reverse=True,
     )
-
+ 
     for rank, group in enumerate(result, start=1):
         group["rank"] = rank
-
+ 
     strong_groups = [
         group for group in result
         if group["breadth_score"] > 0
     ][:top_n]
-
+ 
     weak_groups = sorted(
         [
             group for group in result
@@ -652,7 +652,7 @@ async def groups(
             x["avg_change_pct"],
         ),
     )[:top_n]
-
+ 
     # Compact summaries are intended for the ORCHESTRATOR.
     top_strong_groups = [
         {
@@ -669,7 +669,7 @@ async def groups(
         }
         for group in strong_groups
     ]
-
+ 
     top_weak_groups = [
         {
             "rank": group["rank"],
@@ -685,7 +685,7 @@ async def groups(
         }
         for group in weak_groups
     ]
-
+ 
     return {
         "source": "VCI",
         "status": "OK",
@@ -709,8 +709,8 @@ async def groups(
         "groups": result,
         "failed_batch_details": data["failed_batch_details"],
     }
-
-
+ 
+ 
 @app.get("/health")
 def health():
     return {
@@ -718,8 +718,8 @@ def health():
         "service": "Investment OS Data Gateway",
         "version": "1.0.0",
     }
-
-
+ 
+ 
 @app.get("/ohlcv")
 async def ohlcv(
     symbol: str = Query(
@@ -745,7 +745,7 @@ async def ohlcv(
         resolution=resolution,
         days=days,
     )
-
+ 
     return {
         "symbol": symbol.upper(),
         "market": market,
@@ -754,8 +754,8 @@ async def ohlcv(
         "count": len(candles),
         "candles": candles,
     }
-
-
+ 
+ 
 @app.get("/market")
 async def market():
     vnindex_daily = await fetch_dnse_ohlcv(
@@ -764,63 +764,63 @@ async def market():
         resolution="1D",
         days=180,
     )
-
+ 
     vn30_daily = await fetch_dnse_ohlcv(
         symbol="VN30",
         market="index",
         resolution="1D",
         days=180,
     )
-
+ 
     return {
         "source": "DNSE",
         "resolution": "1D",
         "vnindex": _market_snapshot(vnindex_daily),
         "vn30": _market_snapshot(vn30_daily),
     }
-
-
+ 
+ 
 @app.get("/breadth")
 async def breadth():
     data = await _load_vci_stock_prices()
-
+ 
     if "error" in data:
         return {
             "source": "VCI",
             "status": "ERROR",
             "error": data["error"],
         }
-
+ 
     prices = data["prices"]
-
+ 
     advances = 0
     declines = 0
     unchanged = 0
     strong_advances = 0
     strong_declines = 0
     priced_stocks = 0
-
+ 
     for item in prices:
         row = _extract_stock_row(item)
-
+ 
         if not row:
             continue
-
+ 
         priced_stocks += 1
         change_pct = row["change_pct"]
-
+ 
         if change_pct > 0:
             advances += 1
         elif change_pct < 0:
             declines += 1
         else:
             unchanged += 1
-
+ 
         if change_pct >= 5:
             strong_advances += 1
         elif change_pct <= -5:
             strong_declines += 1
-
+ 
     return {
         "source": "VCI",
         "status": "OK",
@@ -837,14 +837,14 @@ async def breadth():
         "strong_declines_5pct": strong_declines,
         "failed_batch_details": data["failed_batch_details"],
     }
-
-
-
-
+ 
+ 
+ 
+ 
 # ---------------------------------------------------------------------------
 # RS O'NEIL ENGINE CACHE
 # ---------------------------------------------------------------------------
-
+ 
 RS_CACHE = {
     "status": "EMPTY",
     "ranking_status": "NOT_READY",
@@ -878,37 +878,37 @@ RS_CACHE = {
     "errors": [],
     "history_counts": [],
 }
-
+ 
 def _period_return(closes, sessions):
     """Percentage change in price over the requested trailing sessions."""
     if len(closes) <= sessions:
         return None
-
+ 
     start_price = _float(closes[-1 - sessions])
     end_price = _float(closes[-1])
-
+ 
     if start_price <= 0 or end_price <= 0:
         return None
-
+ 
     return (end_price / start_price - 1) * 100
-
-
+ 
+ 
 def _oneil_price_score(candles):
     """
     Investment OS RS price score, using trailing cumulative price change.
-
+ 
     The requested horizons are independent trailing windows:
       3 months  = price % change over the latest ~63 trading sessions
       6 months  = price % change over the latest ~126 trading sessions
       9 months  = price % change over the latest ~189 trading sessions
       12 months = price % change over the latest ~250 trading sessions
-
+ 
     Weighted P_Score:
       3m  40%
       6m  30%
       9m  20%
       12m 10%
-
+ 
     Minimum history is >250 valid daily candles (>=251), so the full
     12-month trailing return can be calculated. VN-Index is NOT used
     inside the stock RS formula.
@@ -918,27 +918,27 @@ def _oneil_price_score(candles):
         if isinstance(item, dict) and _float(item.get("close")) > 0
     ]
     candles = sorted(candles, key=lambda x: x.get("time", 0))
-
+ 
     if len(candles) < 251:
         return None
-
+ 
     closes = [_float(item.get("close")) for item in candles]
-
+ 
     r3 = _period_return(closes, 63)
     r6 = _period_return(closes, 126)
     r9 = _period_return(closes, 189)
     r12 = _period_return(closes, 250)
-
+ 
     if any(value is None for value in (r3, r6, r9, r12)):
         return None
-
+ 
     p_score = (
         0.40 * r3
         + 0.30 * r6
         + 0.20 * r9
         + 0.10 * r12
     )
-
+ 
     return {
         "return_3m_pct": round(r3, 2),
         "return_6m_pct": round(r6, 2),
@@ -949,23 +949,23 @@ def _oneil_price_score(candles):
         "first_time": candles[0].get("time"),
         "last_time": candles[-1].get("time"),
     }
-
+ 
 def _assign_rs_ratings(rows):
     """
     Convert P_Score cross-section into RS Rating 1-99.
     Highest P_Score receives 99; lowest receives 1.
     """
     ranked = sorted(rows, key=lambda x: x["p_score"])
-
+ 
     n = len(ranked)
     if n == 0:
         return []
-
+ 
     if n == 1:
         ranked[0]["rs_rating"] = 99
         ranked[0]["rs_percentile"] = 100.0
         return ranked
-
+ 
     # Average percentile for exact P_Score ties.
     i = 0
     while i < n:
@@ -975,18 +975,18 @@ def _assign_rs_ratings(rows):
             and ranked[j + 1]["p_score"] == ranked[i]["p_score"]
         ):
             j += 1
-
+ 
         avg_rank_zero_based = (i + j) / 2
         percentile = avg_rank_zero_based / (n - 1) * 100
         rating = int(round(1 + percentile / 100 * 98))
         rating = max(1, min(99, rating))
-
+ 
         for k in range(i, j + 1):
             ranked[k]["rs_percentile"] = round(percentile, 2)
             ranked[k]["rs_rating"] = rating
-
+ 
         i = j + 1
-
+ 
     return sorted(
         ranked,
         key=lambda x: (
@@ -995,8 +995,8 @@ def _assign_rs_ratings(rows):
         ),
         reverse=True,
     )
-
-
+ 
+ 
 async def _fetch_rs_history_one(symbol, semaphore, days):
     async with semaphore:
         started = time.perf_counter()
@@ -1009,7 +1009,7 @@ async def _fetch_rs_history_one(symbol, semaphore, days):
             )
             candles = candles if isinstance(candles, list) else []
             score = _oneil_price_score(candles)
-
+ 
             return {
                 "symbol": symbol,
                 "status": (
@@ -1036,8 +1036,8 @@ async def _fetch_rs_history_one(symbol, semaphore, days):
                 ),
                 "error": str(exc),
             }
-
-
+ 
+ 
 async def _load_vci_symbols_only():
     """Load the stock universe without fetching the current price board."""
     async with httpx.AsyncClient(timeout=30) as client:
@@ -1045,21 +1045,21 @@ async def _load_vci_symbols_only():
             VCI_SYMBOLS_URL,
             headers=VCI_HEADERS,
         )
-
+ 
     if not response.is_success:
         return {
             "error": f"getAll failed: HTTP {response.status_code}"
         }
-
+ 
     payload = response.json()
-
+ 
     if isinstance(payload, dict):
         universe = payload.get("data", [])
     elif isinstance(payload, list):
         universe = payload
     else:
         universe = []
-
+ 
     symbols = []
     for item in universe:
         if not isinstance(item, dict):
@@ -1071,12 +1071,12 @@ async def _load_vci_symbols_only():
         symbol = item.get("symbol")
         if symbol:
             symbols.append(str(symbol).upper())
-
+ 
     return {
         "symbols": list(dict.fromkeys(symbols))
     }
-
-
+ 
+ 
 @app.get("/leaders")
 async def leaders(
     top_n: int = Query(
@@ -1098,12 +1098,12 @@ async def leaders(
 ):
     """
     Leader V3.
-
+ 
     Locked formula:
       RS Rating O'Neil 40%
       Liquidity percentile 30%
       Group strength 30%
-
+ 
     RS must already exist in RS_CACHE. No VN-Index comparison is used
     in the RS component.
     """
@@ -1115,21 +1115,21 @@ async def leaders(
             "reason": "O'Neil RS cache is not ready",
             "next": "Run /rs-refresh and wait for /rs-status",
         }
-
+ 
     data = await _load_vci_stock_prices()
-
+ 
     if "error" in data:
         return {
             "source": "VCI",
             "status": "ERROR",
             "error": data["error"],
         }
-
+ 
     async with httpx.AsyncClient(timeout=30) as client:
         icb = await _load_vci_icb_mapping(client, level=2)
-
+ 
     mapping = icb["mapping"]
-
+ 
     symbol_to_code = {}
     for item in data.get("universe_items", []):
         if not isinstance(item, dict):
@@ -1138,26 +1138,26 @@ async def leaders(
         code = _extract_icb_code(item)
         if symbol and code:
             symbol_to_code[str(symbol).upper()] = code
-
+ 
     stocks = []
     for item in data["prices"]:
         row = _extract_stock_row(item)
         if not row:
             continue
-
+ 
         symbol = str(row["symbol"]).upper()
         code = symbol_to_code.get(symbol)
-
+ 
         if code:
             group_name = mapping.get(code) or f"ICB {code}"
         else:
             group_name = "UNKNOWN"
-
+ 
         row["symbol"] = symbol
         row["icb_code"] = code
         row["group"] = group_name
         stocks.append(row)
-
+ 
     # Group breadth score from current cross-section.
     group_stats = {}
     for stock in stocks:
@@ -1175,7 +1175,7 @@ async def leaders(
             stats["advances"] += 1
         elif stock["change_pct"] < 0:
             stats["declines"] += 1
-
+ 
     for stats in group_stats.values():
         count = stats["stocks"]
         stats["breadth_score"] = (
@@ -1187,7 +1187,7 @@ async def leaders(
             0.0,
             min(100.0, (stats["breadth_score"] + 100) / 2),
         )
-
+ 
     # Liquidity percentile from current session volume.
     volume_stocks = sorted(
         [stock for stock in stocks if stock["volume"] > 0],
@@ -1195,7 +1195,7 @@ async def leaders(
     )
     volume_count = len(volume_stocks)
     volume_score = {}
-
+ 
     for rank, stock in enumerate(volume_stocks, start=1):
         if volume_count <= 1:
             percentile = 100.0
@@ -1204,29 +1204,29 @@ async def leaders(
                 (rank - 1) / (volume_count - 1) * 100
             )
         volume_score[stock["symbol"]] = percentile
-
+ 
     rs_map = RS_CACHE.get("by_symbol", {})
     eligible = []
-
+ 
     for stock in stocks:
         rs_row = rs_map.get(stock["symbol"])
         if not rs_row:
             continue
-
+ 
         liquidity_score = volume_score.get(stock["symbol"], 0.0)
         group = group_stats.get(stock["group"], {})
         group_score = group.get("group_score", 0.0)
         rs_rating = rs_row["rs_rating"]
-
+ 
         # Normalize 1..99 RS rating to 0..100 before applying 40%.
         rs_score_100 = (rs_rating - 1) / 98 * 100
-
+ 
         leader_score = (
             0.40 * rs_score_100
             + 0.30 * liquidity_score
             + 0.30 * group_score
         )
-
+ 
         stock["rs_rating"] = rs_rating
         stock["rs_percentile"] = rs_row["rs_percentile"]
         stock["p_score"] = rs_row["p_score"]
@@ -1245,10 +1245,10 @@ async def leaders(
             stock["price"] >= min_price
             and stock["volume"] >= min_volume
         )
-
+ 
         if stock["eligible_default"]:
             eligible.append(stock)
-
+ 
     eligible.sort(
         key=lambda x: (
             x["leader_score"],
@@ -1257,7 +1257,7 @@ async def leaders(
         ),
         reverse=True,
     )
-
+ 
     def compact(stock):
         return {
             "symbol": stock["symbol"],
@@ -1279,7 +1279,7 @@ async def leaders(
             "leader_score": stock["leader_score"],
             "volume_source": stock["volume_source"],
         }
-
+ 
     return {
         "source": "VCI + DNSE",
         "status": "OK",
@@ -1308,8 +1308,8 @@ async def leaders(
         "mapping_error": icb["error"],
         "failed_batch_details": data["failed_batch_details"],
     }
-
-
+ 
+ 
 async def _load_rs_history_batch(
     symbols,
     days=600,
@@ -1317,11 +1317,11 @@ async def _load_rs_history_batch(
 ):
     """Fetch daily history and calculate the RS score for one batch."""
     semaphore = asyncio.Semaphore(max(1, min(concurrency, 20)))
-
+ 
     async def fetch_one(symbol):
         async with semaphore:
             started = time.perf_counter()
-
+ 
             try:
                 candles = await fetch_dnse_ohlcv(
                     symbol=symbol,
@@ -1329,12 +1329,12 @@ async def _load_rs_history_batch(
                     resolution="1D",
                     days=days,
                 )
-
+ 
                 elapsed_ms = round(
                     (time.perf_counter() - started) * 1000,
                     1,
                 )
-
+ 
                 candles = candles if isinstance(candles, list) else []
                 candles = [
                     item for item in candles
@@ -1342,7 +1342,7 @@ async def _load_rs_history_batch(
                     and _float(item.get("close")) > 0
                 ]
                 candles.sort(key=lambda x: x.get("time", 0))
-
+ 
                 if not candles:
                     return {
                         "symbol": symbol,
@@ -1353,9 +1353,9 @@ async def _load_rs_history_batch(
                         "last_time": None,
                         "elapsed_ms": elapsed_ms,
                     }
-
+ 
                 score = _oneil_price_score(candles)
-
+ 
                 return {
                     "symbol": symbol,
                     "status": (
@@ -1369,7 +1369,7 @@ async def _load_rs_history_batch(
                     "last_time": candles[-1].get("time"),
                     "elapsed_ms": elapsed_ms,
                 }
-
+ 
             except Exception as exc:
                 return {
                     "symbol": symbol,
@@ -1384,12 +1384,12 @@ async def _load_rs_history_batch(
                     ),
                     "error": str(exc),
                 }
-
+ 
     return await asyncio.gather(
         *(fetch_one(symbol) for symbol in symbols)
     )
-
-
+ 
+ 
 async def _load_vci_symbols_only():
     """Load the eligible stock universe without current prices."""
     async with httpx.AsyncClient(timeout=30) as client:
@@ -1397,21 +1397,21 @@ async def _load_vci_symbols_only():
             VCI_SYMBOLS_URL,
             headers=VCI_HEADERS,
         )
-
+ 
     if not response.is_success:
         return {
             "error": f"getAll failed: HTTP {response.status_code}"
         }
-
+ 
     payload = response.json()
-
+ 
     if isinstance(payload, dict):
         universe = payload.get("data", [])
     elif isinstance(payload, list):
         universe = payload
     else:
         universe = []
-
+ 
     symbols = []
     for item in universe:
         if not isinstance(item, dict):
@@ -1423,21 +1423,21 @@ async def _load_vci_symbols_only():
         symbol = item.get("symbol")
         if symbol:
             symbols.append(str(symbol).upper())
-
+ 
     return {"symbols": list(dict.fromkeys(symbols))}
-
-
+ 
+ 
 def _build_rs_rows(all_results):
     eligible_rows = []
-
+ 
     for item in all_results:
         if item.get("status") != "ELIGIBLE":
             continue
-
+ 
         score = item.get("score")
         if not score:
             continue
-
+ 
         eligible_rows.append({
             "symbol": item["symbol"],
             "candles": score["candles"],
@@ -1449,31 +1449,31 @@ def _build_rs_rows(all_results):
             "return_12m_pct": score["return_12m_pct"],
             "p_score": score["p_score"],
         })
-
+ 
     return _assign_rs_ratings(eligible_rows)
-
-
-
+ 
+ 
+ 
 async def _initialize_rs_batch_run(days=600, concurrency=8, limit=100, batch_size=50):
     """Initialize a manual, request-driven RS Batch V5 run."""
     global RS_CACHE
-
+ 
     universe = await _load_vci_symbols_only()
     if "error" in universe:
         raise RuntimeError(universe["error"])
-
+ 
     symbols = universe.get("symbols", [])
     if limit and limit > 0:
         symbols = symbols[:limit]
-
+ 
     if not symbols:
         raise RuntimeError("No eligible stock symbols found")
-
+ 
     batches = [
         symbols[i:i + batch_size]
         for i in range(0, len(symbols), batch_size)
     ]
-
+ 
     RS_CACHE = {
         "status": "READY_FOR_BATCH",
         "ranking_status": "NOT_READY",
@@ -1504,14 +1504,14 @@ async def _initialize_rs_batch_run(days=600, concurrency=8, limit=100, batch_siz
         "history_counts": [],
         "results": [],
     }
-
+ 
     if not _save_rs_checkpoint([]):
         raise RuntimeError("Could not save RS checkpoint")
-
+ 
     RS_CACHE["checkpoint_saved_at"] = time.time()
     return batches
-
-
+ 
+ 
 def _restore_rs_checkpoint():
     """Restore the manual batch state from the local checkpoint if available."""
     global RS_CACHE
@@ -1529,23 +1529,23 @@ def _restore_rs_checkpoint():
         return True
     except Exception:
         return False
-
-
+ 
+ 
 async def _process_rs_batch(batch_number: int):
     """Process exactly one RS history batch in one HTTP request."""
     global RS_CACHE
-
+ 
     if RS_CACHE.get("requested_symbols", 0) == 0:
         if not _restore_rs_checkpoint():
             return {"status": "EMPTY", "message": "Run /rs-refresh first"}
-
+ 
     total_batches = RS_CACHE.get("total_batches", 0)
     if batch_number < 1 or batch_number > total_batches:
         return {
             "status": "ERROR",
             "message": f"batch must be between 1 and {total_batches}",
         }
-
+ 
     completed = RS_CACHE.get("completed_batches", 0)
     if batch_number <= completed:
         return {
@@ -1554,7 +1554,7 @@ async def _process_rs_batch(batch_number: int):
             "completed_batches": completed,
             "total_batches": total_batches,
         }
-
+ 
     if batch_number != completed + 1:
         return {
             "status": "ERROR",
@@ -1562,17 +1562,17 @@ async def _process_rs_batch(batch_number: int):
             "completed_batches": completed,
             "requested_batch": batch_number,
         }
-
+ 
     symbols = RS_CACHE.get("symbols", [])
     start = (batch_number - 1) * RS_CACHE["batch_size"]
     end = min(start + RS_CACHE["batch_size"], len(symbols))
     batch = symbols[start:end]
-
+ 
     started = time.perf_counter()
     RS_CACHE["status"] = "RUNNING_BATCH"
     RS_CACHE["current_batch"] = batch_number
     RS_CACHE["last_batch_status"] = "RUNNING"
-
+ 
     try:
         results = await _load_rs_history_batch(
             symbols=batch,
@@ -1623,7 +1623,7 @@ async def _process_rs_batch(batch_number: int):
         if not _save_rs_checkpoint(all_results):
             RS_CACHE["last_batch_status"] = "CHECKPOINT_FAILED"
             RS_CACHE["errors"].append({"error": "Checkpoint save failed"})
-
+ 
         batch_elapsed = round((time.perf_counter() - started) * 1000, 1)
         next_batch = batch_number + 1 if batch_number < total_batches else None
         return {
@@ -1657,8 +1657,8 @@ async def _process_rs_batch(batch_number: int):
             "batch": batch_number,
             "error": str(exc),
         }
-
-
+ 
+ 
 @app.get("/rs-refresh")
 async def rs_refresh(
     days: int = Query(600, ge=400, le=900),
@@ -1692,25 +1692,25 @@ async def rs_refresh(
         }
     except Exception as exc:
         return {"status": "ERROR", "error": str(exc)}
-
-
+ 
+ 
 @app.get("/rs-batch")
 async def rs_batch(
     batch: int = Query(1, ge=1, description="Batch number, starting at 1"),
 ):
     """Process exactly one RS batch and return the next batch to call."""
     return await _process_rs_batch(batch)
-
-
+ 
+ 
 @app.get("/rs-finalize")
 async def rs_finalize():
     """Finalize the complete cross-sectional RS 1-99 ranking."""
     global RS_CACHE
-
+ 
     if RS_CACHE.get("requested_symbols", 0) == 0:
         if not _restore_rs_checkpoint():
             return {"status": "EMPTY", "message": "Run /rs-refresh first"}
-
+ 
     if RS_CACHE.get("completed_batches", 0) != RS_CACHE.get("total_batches", 0):
         return {
             "status": "NOT_READY",
@@ -1718,7 +1718,7 @@ async def rs_finalize():
             "total_batches": RS_CACHE.get("total_batches", 0),
             "next_batch": RS_CACHE.get("completed_batches", 0) + 1,
         }
-
+ 
     started = time.perf_counter()
     all_results = RS_CACHE.get("results", [])
     final_rows = _build_rs_rows(all_results)
@@ -1733,7 +1733,7 @@ async def rs_finalize():
     )
     RS_CACHE["checkpoint_saved_at"] = time.time()
     _save_rs_checkpoint(all_results)
-
+ 
     return {
         "status": RS_CACHE["status"],
         "ranking_status": "FINAL",
@@ -1746,16 +1746,16 @@ async def rs_finalize():
         "elapsed_ms": RS_CACHE["elapsed_ms"],
         "next": "Call /rs?top_n=50",
     }
-
-
+ 
+ 
 @app.get("/rs-status")
 async def rs_status():
     if RS_CACHE.get("requested_symbols", 0) == 0:
         _restore_rs_checkpoint()
-
+ 
     processed = RS_CACHE.get("processed_symbols", 0)
     requested = RS_CACHE.get("requested_symbols", 0)
-
+ 
     return {
         "status": RS_CACHE.get("status"),
         "ranking_status": RS_CACHE.get("ranking_status"),
@@ -1782,30 +1782,30 @@ async def rs_status():
         "elapsed_ms": RS_CACHE.get("elapsed_ms"),
         "errors": RS_CACHE.get("errors", [])[:10],
     }
-
-
-
-
+ 
+ 
+ 
+ 
 # ---------------------------------------------------------------------------
 # RS BATCH V5: STATELESS BATCH API
 # The browser carries the run manifest/results in localStorage. Each HTTP
 # batch request is self-contained and does not depend on server RAM/files.
 # ---------------------------------------------------------------------------
-
+ 
 class RSBatchRequest(BaseModel):
     symbols: list[str] = Field(min_length=1, max_length=100)
     days: int = Field(default=600, ge=400, le=900)
     concurrency: int = Field(default=6, ge=1, le=12)
-
-
+ 
+ 
 class RSFinalizeRequest(BaseModel):
     symbols: list[str] = Field(min_length=1, max_length=2000)
     results: list[dict] = Field(max_length=2000)
     days: int = Field(default=600, ge=400, le=900)
     concurrency: int = Field(default=6, ge=1, le=12)
     batch_size: int = Field(default=50, ge=25, le=100)
-
-
+ 
+ 
 @app.get("/rs-universe")
 async def rs_universe(limit: int = Query(1522, ge=1, le=2000)):
     """Return a stable symbol manifest for browser-managed resumable runs."""
@@ -1821,8 +1821,8 @@ async def rs_universe(limit: int = Query(1522, ge=1, le=2000)):
         "requested_symbols": len(symbols),
         "symbols": symbols,
     }
-
-
+ 
+ 
 @app.post("/rs-batch-stateless")
 async def rs_batch_stateless(payload: RSBatchRequest):
     """Process one explicit symbol batch without requiring server-side run state."""
@@ -1850,8 +1850,8 @@ async def rs_batch_stateless(payload: RSBatchRequest):
         "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
         "results": results,
     }
-
-
+ 
+ 
 @app.post("/rs-finalize-client")
 async def rs_finalize_client(payload: RSFinalizeRequest):
     """Accept browser-held batch results and build the final cross-sectional ranking."""
@@ -1864,7 +1864,7 @@ async def rs_finalize_client(payload: RSFinalizeRequest):
         if not isinstance(item, dict) or not item.get("symbol"):
             continue
         results_by_symbol[str(item["symbol"]).upper()] = item
-
+ 
     # Keep exactly one result per requested symbol; absent symbols become explicit errors.
     ordered_results = []
     for symbol in symbols:
@@ -1875,7 +1875,7 @@ async def rs_finalize_client(payload: RSFinalizeRequest):
                 "score": None, "error": "No result received from browser batch runner"
             }
         ordered_results.append(item)
-
+ 
     eligible_rows = _build_rs_rows(ordered_results)
     completed = len(symbols)
     total_batches = (completed + payload.batch_size - 1) // payload.batch_size
@@ -1935,8 +1935,8 @@ async def rs_finalize_client(payload: RSFinalizeRequest):
         "vnindex_in_formula": False,
         "next": "Call /rs?top_n=50",
     }
-
-
+ 
+ 
 @app.get("/rs-run-all", response_class=HTMLResponse)
 async def rs_run_all_page(
     limit: int = Query(1522, ge=1, le=2000),
@@ -1945,7 +1945,7 @@ async def rs_run_all_page(
     batch_size: int = Query(50, ge=25, le=100),
 ):
     """One-link browser runner.
-
+ 
     The browser sequentially calls the existing /rs-batch endpoint.
     No long-running FastAPI background task is used.
     Each batch remains a separate HTTP request, while this page orchestrates
@@ -1958,7 +1958,7 @@ async def rs_run_all_page(
         "concurrency": concurrency,
         "batch_size": batch_size,
     }
-    title = "Investment OS - RS Batch V5 Run All"
+    title = "Investment OS - RS Batch V5.1 Run All"
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -1974,19 +1974,19 @@ progress{{width:100%;height:24px}}
 </style>
 </head>
 <body>
-<h2>Investment OS — RS Batch V5</h2>
+<h2>Investment OS — RS Batch V5.1</h2>
 <p class="small">Một link → tuần tự chạy từng batch → Finalize. Không dùng Background Task dài.</p>
 <progress id="bar" value="0" max="100"></progress>
 <p id="pct">0%</p>
 <div id="status">Đang chuẩn bị...</div>
-
+ 
 <script>
 const CFG = {json.dumps(params)};
-const STORE_KEY = "investment_os_rs_batch_v5_" + CFG.limit + "_" + CFG.days + "_" + CFG.batch_size;
+const STORE_KEY = "investment_os_rs_batch_v5_1_" + CFG.limit + "_" + CFG.days + "_" + CFG.batch_size;
 const out = document.getElementById("status");
 const bar = document.getElementById("bar");
 const pct = document.getElementById("pct");
-
+ 
 function show(x) {{
   out.textContent = typeof x === "string" ? x : JSON.stringify(x, null, 2);
 }}
@@ -2021,7 +2021,7 @@ function loadState() {{
   catch(e) {{ return null; }}
 }}
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
-
+ 
 async function main() {{
   try {{
     let state = loadState();
@@ -2029,7 +2029,7 @@ async function main() {{
       state.config.limit === CFG.limit &&
       state.config.days === CFG.days &&
       state.config.batch_size === CFG.batch_size;
-
+ 
     if (!compatible || !Array.isArray(state.symbols) || !Array.isArray(state.results)) {{
       show("Đang lấy danh sách mã và tạo phiên RS có thể khôi phục...");
       const manifest = await getJSON(`/rs-universe?limit=${{CFG.limit}}`);
@@ -2040,11 +2040,11 @@ async function main() {{
       }};
       saveState(state);
     }}
-
+ 
     const symbols = state.symbols;
     const total = Math.ceil(symbols.length / CFG.batch_size);
     const bySymbol = new Map((state.results || []).map(x => [String(x.symbol).toUpperCase(), x]));
-
+ 
     // Continue only batches that have not been recorded in browser storage.
     for (let b = 0; b < total; b++) {{
       const batchSymbols = symbols.slice(b * CFG.batch_size, (b + 1) * CFG.batch_size);
@@ -2077,7 +2077,7 @@ async function main() {{
       saveState(state);
       updateProgress(state.results.length, symbols.length);
     }}
-
+ 
     // Restore original universe order and ensure one result per requested symbol.
     state.results = symbols.map(s => bySymbol.get(String(s).toUpperCase())).filter(Boolean);
     saveState(state);
@@ -2089,20 +2089,20 @@ async function main() {{
     updateProgress(symbols.length, symbols.length);
     show(final);
     if (final.ranking_status === "FINAL") {{
-      out.textContent += "\n\nHOÀN TẤT. Mở /rs?top_n=50 để xem RS. Hãy giữ nguyên tab này đến khi thấy kết quả cuối.";
+      out.textContent += "\\n\\nHOÀN TẤT. Mở /rs?top_n=50 để xem RS. Hãy giữ nguyên tab này đến khi thấy kết quả cuối.";
       state.final = true;
       saveState(state);
     }}
   }} catch(e) {{
-    show("TẠM DỪNG — dữ liệu các batch đã hoàn tất vẫn được lưu trên trình duyệt nếu có.\nLỗi: " + e.message +
-      "\nMở lại cùng một link để tiếp tục từ những mã chưa có kết quả.");
+    show("TẠM DỪNG — dữ liệu các batch đã hoàn tất vẫn được lưu trên trình duyệt nếu có.\\nLỗi: " + e.message +
+      "\\nMở lại cùng một link để tiếp tục từ những mã chưa có kết quả.");
   }}
 }}
 main();
 </script>
 </body>
 </html>"""
-
+ 
 @app.get("/rs-reset")
 async def rs_reset():
     global RS_CACHE
@@ -2125,8 +2125,8 @@ async def rs_reset():
         "errors": [], "history_counts": [], "results": [],
     }
     return {"status": "RESET", "engine": "RS Batch V3"}
-
-
+ 
+ 
 @app.get("/rs")
 async def rs_ranking(
     top_n: int = Query(50, ge=5, le=200, description="Số mã RS cao nhất trả về"),
@@ -2140,7 +2140,7 @@ async def rs_ranking(
             "message": "RS ranking is not final. Complete all batches and call /rs-finalize.",
             "eligible_symbols": RS_CACHE.get("eligible_symbols", 0),
         }
-
+ 
     return {
         "source": "VCI universe + DNSE history",
         "status": status,
@@ -2164,8 +2164,8 @@ async def rs_ranking(
         "elapsed_ms": RS_CACHE.get("elapsed_ms"),
         "top_rs": RS_CACHE.get("rows", [])[:top_n],
     }
-
-
+ 
+ 
 @app.get("/rs-benchmark")
 async def rs_benchmark():
     """Validate the two mandatory long-history benchmarks used by the OS."""
@@ -2175,10 +2175,10 @@ async def rs_benchmark():
     vcb = await fetch_dnse_ohlcv(
         symbol="VCB", market="stock", resolution="1D", days=600
     )
-
+ 
     vnindex_count = len(vnindex) if isinstance(vnindex, list) else 0
     vcb_count = len(vcb) if isinstance(vcb, list) else 0
-
+ 
     return {
         "source": "DNSE",
         "status": "OK",
@@ -2197,8 +2197,8 @@ async def rs_benchmark():
         },
         "vnindex_in_stock_rs_formula": False,
     }
-
-
+ 
+ 
 @app.get("/rs-history-test")
 async def rs_history_test(
     limit: int = Query(
@@ -2221,15 +2221,15 @@ async def rs_history_test(
     ),
 ):
     """Benchmark the bulk historical-data mechanism before full-market RS.
-
+ 
     It uses the VCI universe to select stock symbols, then fetches DNSE daily
     history concurrently. The endpoint intentionally stops at data validation;
     no RS score/ranking is produced here.
     """
     started = time.perf_counter()
-
+ 
     data = await _load_vci_stock_prices()
-
+ 
     if "error" in data:
         return {
             "source": "VCI + DNSE",
@@ -2237,24 +2237,24 @@ async def rs_history_test(
             "stage": "universe",
             "error": data["error"],
         }
-
+ 
     symbols = data.get("symbols", [])[:limit]
     results = await _load_rs_history_batch(
         symbols=symbols,
         days=days,
         concurrency=concurrency,
     )
-
+ 
     successful = [
         item for item in results
         if item["status"] in ("ELIGIBLE", "INSUFFICIENT_HISTORY")
     ]
     empty = [item for item in results if item["status"] == "EMPTY"]
     errors = [item for item in results if item["status"] == "ERROR"]
-
+ 
     counts = [item["count"] for item in successful]
     elapsed_ms = round((time.perf_counter() - started) * 1000, 1)
-
+ 
     return {
         "source": "VCI + DNSE",
         "status": "OK" if not errors else "PARTIAL",
