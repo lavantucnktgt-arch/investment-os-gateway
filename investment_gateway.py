@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Query
+from pydantic import BaseModel, Field
 from fastapi.responses import HTMLResponse
 import asyncio
 import time
@@ -11,7 +12,7 @@ from adapters.dnse import fetch_dnse_ohlcv
 
 app = FastAPI(
     title="Investment OS Data Gateway",
-    version="7.0.0",
+    version="8.0.0",
 )
 
 
@@ -1454,7 +1455,7 @@ def _build_rs_rows(all_results):
 
 
 async def _initialize_rs_batch_run(days=600, concurrency=8, limit=100, batch_size=50):
-    """Initialize a manual, request-driven RS Batch V3 run."""
+    """Initialize a manual, request-driven RS Batch V5 run."""
     global RS_CACHE
 
     universe = await _load_vci_symbols_only()
@@ -1784,6 +1785,158 @@ async def rs_status():
 
 
 
+
+# ---------------------------------------------------------------------------
+# RS BATCH V5: STATELESS BATCH API
+# The browser carries the run manifest/results in localStorage. Each HTTP
+# batch request is self-contained and does not depend on server RAM/files.
+# ---------------------------------------------------------------------------
+
+class RSBatchRequest(BaseModel):
+    symbols: list[str] = Field(min_length=1, max_length=100)
+    days: int = Field(default=600, ge=400, le=900)
+    concurrency: int = Field(default=6, ge=1, le=12)
+
+
+class RSFinalizeRequest(BaseModel):
+    symbols: list[str] = Field(min_length=1, max_length=2000)
+    results: list[dict] = Field(max_length=2000)
+    days: int = Field(default=600, ge=400, le=900)
+    concurrency: int = Field(default=6, ge=1, le=12)
+    batch_size: int = Field(default=50, ge=25, le=100)
+
+
+@app.get("/rs-universe")
+async def rs_universe(limit: int = Query(1522, ge=1, le=2000)):
+    """Return a stable symbol manifest for browser-managed resumable runs."""
+    universe = await _load_vci_symbols_only()
+    if "error" in universe:
+        return {"status": "ERROR", "message": universe["error"]}
+    symbols = universe.get("symbols", [])[:limit]
+    if not symbols:
+        return {"status": "EMPTY", "message": "No eligible stock symbols"}
+    return {
+        "status": "OK",
+        "source": "VCI",
+        "requested_symbols": len(symbols),
+        "symbols": symbols,
+    }
+
+
+@app.post("/rs-batch-stateless")
+async def rs_batch_stateless(payload: RSBatchRequest):
+    """Process one explicit symbol batch without requiring server-side run state."""
+    symbols = list(dict.fromkeys(
+        str(s).strip().upper() for s in payload.symbols if str(s).strip()
+    ))
+    if not symbols:
+        return {"status": "EMPTY", "results": []}
+    started = time.perf_counter()
+    results = await _load_rs_history_batch(
+        symbols=symbols,
+        days=payload.days,
+        concurrency=payload.concurrency,
+    )
+    return {
+        "status": "BATCH_COMPLETE",
+        "batch_symbols": len(symbols),
+        "processed_symbols": len(results),
+        "eligible_symbols": sum(1 for r in results if r.get("status") == "ELIGIBLE"),
+        "empty_symbols": sum(1 for r in results if r.get("status") == "EMPTY"),
+        "insufficient_history_symbols": sum(
+            1 for r in results if r.get("status") == "INSUFFICIENT_HISTORY"
+        ),
+        "failed_symbols": sum(1 for r in results if r.get("status") == "ERROR"),
+        "elapsed_ms": round((time.perf_counter() - started) * 1000, 1),
+        "results": results,
+    }
+
+
+@app.post("/rs-finalize-client")
+async def rs_finalize_client(payload: RSFinalizeRequest):
+    """Accept browser-held batch results and build the final cross-sectional ranking."""
+    global RS_CACHE
+    symbols = list(dict.fromkeys(
+        str(s).strip().upper() for s in payload.symbols if str(s).strip()
+    ))
+    results_by_symbol = {}
+    for item in payload.results:
+        if not isinstance(item, dict) or not item.get("symbol"):
+            continue
+        results_by_symbol[str(item["symbol"]).upper()] = item
+
+    # Keep exactly one result per requested symbol; absent symbols become explicit errors.
+    ordered_results = []
+    for symbol in symbols:
+        item = results_by_symbol.get(symbol)
+        if item is None:
+            item = {
+                "symbol": symbol, "status": "ERROR", "count": 0,
+                "score": None, "error": "No result received from browser batch runner"
+            }
+        ordered_results.append(item)
+
+    eligible_rows = _build_rs_rows(ordered_results)
+    completed = len(symbols)
+    total_batches = (completed + payload.batch_size - 1) // payload.batch_size
+    RS_CACHE = {
+        "status": "OK" if not any(r.get("status") == "ERROR" for r in ordered_results) else "PARTIAL",
+        "ranking_status": "FINAL",
+        "started_at": None,
+        "finished_at": time.time(),
+        "elapsed_ms": None,
+        "requested_symbols": completed,
+        "processed_symbols": completed,
+        "successful_symbols": sum(
+            1 for r in ordered_results
+            if r.get("status") in ("ELIGIBLE", "INSUFFICIENT_HISTORY")
+        ),
+        "eligible_symbols": len(eligible_rows),
+        "empty_symbols": sum(1 for r in ordered_results if r.get("status") == "EMPTY"),
+        "insufficient_history_symbols": sum(
+            1 for r in ordered_results if r.get("status") == "INSUFFICIENT_HISTORY"
+        ),
+        "failed_symbols": sum(1 for r in ordered_results if r.get("status") == "ERROR"),
+        "days": payload.days,
+        "concurrency": payload.concurrency,
+        "batch_size": payload.batch_size,
+        "current_batch": total_batches,
+        "completed_batches": total_batches,
+        "total_batches": total_batches,
+        "last_batch_status": "OK",
+        "checkpoint_saved_at": time.time(),
+        "formula": {"3m": 0.40, "6m": 0.30, "9m": 0.20, "12m": 0.10},
+        "minimum_candles": 251,
+        "symbols": symbols,
+        "rows": eligible_rows,
+        "by_symbol": {row["symbol"]: row for row in eligible_rows},
+        "errors": [
+            {"symbol": r.get("symbol"), "error": r.get("error")}
+            for r in ordered_results if r.get("status") == "ERROR"
+        ][:50],
+        "history_counts": [r.get("count", 0) for r in ordered_results if r.get("count", 0) > 0],
+        "results": ordered_results,
+    }
+    # Save local checkpoint opportunistically; browser localStorage remains the
+    # source of truth for recovery if the hosting instance restarts.
+    _save_rs_checkpoint(ordered_results)
+    return {
+        "status": RS_CACHE["status"],
+        "ranking_status": "FINAL",
+        "requested_symbols": completed,
+        "processed_symbols": completed,
+        "eligible_symbols": len(eligible_rows),
+        "empty_symbols": RS_CACHE["empty_symbols"],
+        "insufficient_history_symbols": RS_CACHE["insufficient_history_symbols"],
+        "failed_symbols": RS_CACHE["failed_symbols"],
+        "completed_batches": total_batches,
+        "total_batches": total_batches,
+        "formula": {"3m": 0.40, "6m": 0.30, "9m": 0.20, "12m": 0.10},
+        "vnindex_in_formula": False,
+        "next": "Call /rs?top_n=50",
+    }
+
+
 @app.get("/rs-run-all", response_class=HTMLResponse)
 async def rs_run_all_page(
     limit: int = Query(1522, ge=1, le=2000),
@@ -1805,7 +1958,7 @@ async def rs_run_all_page(
         "concurrency": concurrency,
         "batch_size": batch_size,
     }
-    title = "Investment OS - RS Batch V4 Run All"
+    title = "Investment OS - RS Batch V5 Run All"
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -1821,7 +1974,7 @@ progress{{width:100%;height:24px}}
 </style>
 </head>
 <body>
-<h2>Investment OS — RS Batch V4</h2>
+<h2>Investment OS — RS Batch V5</h2>
 <p class="small">Một link → tuần tự chạy từng batch → Finalize. Không dùng Background Task dài.</p>
 <progress id="bar" value="0" max="100"></progress>
 <p id="pct">0%</p>
@@ -1829,6 +1982,7 @@ progress{{width:100%;height:24px}}
 
 <script>
 const CFG = {json.dumps(params)};
+const STORE_KEY = "investment_os_rs_batch_v5_" + CFG.limit + "_" + CFG.days + "_" + CFG.batch_size;
 const out = document.getElementById("status");
 const bar = document.getElementById("bar");
 const pct = document.getElementById("pct");
@@ -1836,65 +1990,114 @@ const pct = document.getElementById("pct");
 function show(x) {{
   out.textContent = typeof x === "string" ? x : JSON.stringify(x, null, 2);
 }}
-
+function updateProgress(done, total) {{
+  const p = total ? (done / total * 100) : 0;
+  bar.value = p;
+  pct.textContent = p.toFixed(1) + "%";
+}}
 async function getJSON(url) {{
   const r = await fetch(url, {{cache:"no-store"}});
-  const text = await r.text();
-  let data;
-  try {{ data = JSON.parse(text); }}
-  catch(e) {{ throw new Error("HTTP " + r.status + ": " + text.slice(0,500)); }}
-  if (!r.ok) throw new Error("HTTP " + r.status + ": " + JSON.stringify(data));
-  return data;
+  const t = await r.text();
+  let d;
+  try {{ d = JSON.parse(t); }} catch(e) {{ throw new Error("HTTP " + r.status + ": " + t.slice(0,400)); }}
+  if (!r.ok) throw new Error("HTTP " + r.status + ": " + JSON.stringify(d));
+  return d;
 }}
+async function postJSON(url, body) {{
+  const r = await fetch(url, {{
+    method:"POST", cache:"no-store",
+    headers:{{"Content-Type":"application/json"}},
+    body:JSON.stringify(body)
+  }});
+  const t = await r.text();
+  let d;
+  try {{ d = JSON.parse(t); }} catch(e) {{ throw new Error("HTTP " + r.status + ": " + t.slice(0,400)); }}
+  if (!r.ok) throw new Error("HTTP " + r.status + ": " + JSON.stringify(d));
+  return d;
+}}
+function saveState(s) {{ localStorage.setItem(STORE_KEY, JSON.stringify(s)); }}
+function loadState() {{
+  try {{ return JSON.parse(localStorage.getItem(STORE_KEY) || "null"); }}
+  catch(e) {{ return null; }}
+}}
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
 async function main() {{
   try {{
-    let s = await getJSON("/rs-status");
+    let state = loadState();
+    const compatible = state && state.config &&
+      state.config.limit === CFG.limit &&
+      state.config.days === CFG.days &&
+      state.config.batch_size === CFG.batch_size;
 
-    const sameRun =
-      Number(s.requested_symbols || 0) === CFG.limit &&
-      Number(s.days || 0) === CFG.days &&
-      Number(s.batch_size || 0) === CFG.batch_size;
-
-    if (!sameRun || s.status === "EMPTY") {{
-      show("Đang khởi tạo RS Batch V4...");
-      s = await getJSON(
-        `/rs-refresh?limit=${{CFG.limit}}&days=${{CFG.days}}&concurrency=${{CFG.concurrency}}&batch_size=${{CFG.batch_size}}`
-      );
-      if (s.status !== "STARTED") throw new Error(JSON.stringify(s));
-    }} else if (s.ranking_status === "FINAL") {{
-      bar.value = 100; pct.textContent = "100%";
-      show(s);
-      return;
+    if (!compatible || !Array.isArray(state.symbols) || !Array.isArray(state.results)) {{
+      show("Đang lấy danh sách mã và tạo phiên RS có thể khôi phục...");
+      const manifest = await getJSON(`/rs-universe?limit=${{CFG.limit}}`);
+      if (manifest.status !== "OK") throw new Error(JSON.stringify(manifest));
+      state = {{
+        config:{{limit:CFG.limit,days:CFG.days,batch_size:CFG.batch_size,concurrency:CFG.concurrency}},
+        symbols:manifest.symbols, results:[], completedBatches:0
+      }};
+      saveState(state);
     }}
 
-    let total = Number(s.total_batches || Math.ceil(CFG.limit / CFG.batch_size));
-    let next = Math.max(1, Number(s.completed_batches || 0) + 1);
+    const symbols = state.symbols;
+    const total = Math.ceil(symbols.length / CFG.batch_size);
+    const bySymbol = new Map((state.results || []).map(x => [String(x.symbol).toUpperCase(), x]));
 
-    for (let b = next; b <= total; b++) {{
-      show(`Đang xử lý batch ${{b}}/${{total}}...\\nKhông đóng trang.`);
-      const r = await getJSON(`/rs-batch?batch=${{b}}`);
-      const progress = Number(r.progress_pct || (b / total * 100));
-      bar.value = progress;
-      pct.textContent = progress.toFixed(1) + "%";
-      if (!["BATCH_COMPLETE","ALL_BATCHES_COMPLETE"].includes(r.status)) {{
-        throw new Error(JSON.stringify(r));
+    // Continue only batches that have not been recorded in browser storage.
+    for (let b = 0; b < total; b++) {{
+      const batchSymbols = symbols.slice(b * CFG.batch_size, (b + 1) * CFG.batch_size);
+      const missing = batchSymbols.filter(s => !bySymbol.has(String(s).toUpperCase()));
+      if (missing.length === 0) {{
+        updateProgress(Math.min((b + 1) * CFG.batch_size, symbols.length), symbols.length);
+        continue;
       }}
+      show(`Đang xử lý batch ${{b+1}}/${{total}} (${{missing.length}} mã cần lấy dữ liệu)...\nKết quả đã lưu trên trình duyệt; có thể tiếp tục nếu gián đoạn.`);
+      let response = null, lastError = null;
+      for (let attempt = 1; attempt <= 3; attempt++) {{
+        try {{
+          response = await postJSON("/rs-batch-stateless", {{
+            symbols:missing, days:CFG.days, concurrency:CFG.concurrency
+          }});
+          if (response.status === "BATCH_COMPLETE" && Array.isArray(response.results)) break;
+          throw new Error(JSON.stringify(response));
+        }} catch(e) {{
+          lastError = e;
+          show(`Batch ${{b+1}}/${{total}} gặp lỗi, thử lại ${{attempt}}/3...\n${{e.message}}`);
+          await sleep(1500 * attempt);
+        }}
+      }}
+      if (!response || response.status !== "BATCH_COMPLETE") {{
+        throw new Error(`Batch ${{b+1}} thất bại sau 3 lần thử: ${{lastError ? lastError.message : "unknown error"}}`);
+      }}
+      for (const item of response.results) bySymbol.set(String(item.symbol).toUpperCase(), item);
+      state.results = Array.from(bySymbol.values());
+      state.completedBatches = b + 1;
+      saveState(state);
+      updateProgress(state.results.length, symbols.length);
     }}
 
-    show("Các batch đã hoàn tất. Đang Finalize...");
-    const final = await getJSON("/rs-finalize");
-    bar.value = 100; pct.textContent = "100%";
+    // Restore original universe order and ensure one result per requested symbol.
+    state.results = symbols.map(s => bySymbol.get(String(s).toUpperCase())).filter(Boolean);
+    saveState(state);
+    show("Tất cả batch đã có kết quả. Đang tính RS Rating 1–99...");
+    const final = await postJSON("/rs-finalize-client", {{
+      symbols, results:state.results, days:CFG.days,
+      concurrency:CFG.concurrency, batch_size:CFG.batch_size
+    }});
+    updateProgress(symbols.length, symbols.length);
     show(final);
-
     if (final.ranking_status === "FINAL") {{
-      out.textContent += "\\n\\nHOÀN TẤT. Mở /rs?top_n=50 để xem RS.";
+      out.textContent += "\n\nHOÀN TẤT. Mở /rs?top_n=50 để xem RS. Hãy giữ nguyên tab này đến khi thấy kết quả cuối.";
+      state.final = true;
+      saveState(state);
     }}
-  }} catch (e) {{
-    show("ERROR\\n" + e.message);
+  }} catch(e) {{
+    show("TẠM DỪNG — dữ liệu các batch đã hoàn tất vẫn được lưu trên trình duyệt nếu có.\nLỗi: " + e.message +
+      "\nMở lại cùng một link để tiếp tục từ những mã chưa có kết quả.");
   }}
 }}
-
 main();
 </script>
 </body>
