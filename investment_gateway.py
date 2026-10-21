@@ -1,5 +1,3 @@
-Investment OS Gateway — RS Adaptive Retry
-Bản mã nguồn đầy đủ để thay thế investment_gateway.py trên GitHub. Bản này tự chia nhỏ batch khi gặp HTTP 502, giảm concurrency ở nhánh phục hồi và giữ các kết quả trên trình duyệt.
 from fastapi import FastAPI, Query
 from pydantic import BaseModel, Field
 from fastapi.responses import HTMLResponse
