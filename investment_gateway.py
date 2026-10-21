@@ -1,3 +1,5 @@
+Investment OS Gateway — RS Adaptive Retry
+Bản mã nguồn đầy đủ để thay thế investment_gateway.py trên GitHub. Bản này tự chia nhỏ batch khi gặp HTTP 502, giảm concurrency ở nhánh phục hồi và giữ các kết quả trên trình duyệt.
 from fastapi import FastAPI, Query
 from pydantic import BaseModel, Field
 from fastapi.responses import HTMLResponse
@@ -2000,7 +2002,7 @@ progress{{width:100%;height:24px}}
 </style>
 </head>
 <body>
-<h2>Investment OS — RS Batch V5.1</h2>
+<h2>Investment OS — RS Batch V5.2 Adaptive Retry</h2>
 <p class="small">Một link → tuần tự chạy từng batch → Finalize. Không dùng Background Task dài.</p>
 <progress id="bar" value="0" max="100"></progress>
 <p id="pct">0%</p>
@@ -2048,6 +2050,63 @@ function loadState() {{
 }}
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
  
+// Adaptive recovery: if a large request receives HTTP 502, split it into
+// smaller requests. This avoids retrying the same failing 50-symbol payload.
+async function requestAdaptive(batchSymbols, depth=0) {{
+  let lastError = null;
+  for (let attempt = 1; attempt <= 2; attempt++) {{
+    try {{
+      const response = await postJSON("/rs-batch-stateless", {{
+        symbols:batchSymbols, days:CFG.days,
+        // Reduce pressure on the data provider when recovering from failures.
+        concurrency: depth > 0 ? 2 : CFG.concurrency
+      }});
+      if (response.status !== "BATCH_COMPLETE" || !Array.isArray(response.results)) {{
+        throw new Error(JSON.stringify(response));
+      }}
+      const returned = new Map(response.results.map(x => [String(x.symbol).toUpperCase(), x]));
+      const missingOrFailed = batchSymbols.filter(sym => {{
+        const item = returned.get(String(sym).toUpperCase());
+        return !item || item.status === "ERROR";
+      }});
+      const good = batchSymbols
+        .map(sym => returned.get(String(sym).toUpperCase()))
+        .filter(item => item && item.status !== "ERROR");
+      if (missingOrFailed.length === 0) return response.results;
+      if (missingOrFailed.length === 1) {{
+        const bad = returned.get(String(missingOrFailed[0]).toUpperCase());
+        // Retry the one bad symbol through the recursive path below.
+        if (batchSymbols.length === 1) {{
+          throw new Error((bad && bad.error) || "Single-symbol history request failed");
+        }}
+      }}
+      const recovered = [];
+      for (let i = 0; i < missingOrFailed.length; i++) {{
+        recovered.push(...await requestAdaptive([missingOrFailed[i]], depth + 1));
+      }}
+      return good.concat(recovered);
+    }} catch(e) {{
+      lastError = e;
+      if (attempt < 2) await sleep(900 * attempt);
+    }}
+  }}
+ 
+  if (batchSymbols.length > 1) {{
+    const middle = Math.ceil(batchSymbols.length / 2);
+    show(`HTTP 502/lỗi lô ở ${{batchSymbols.length}} mã; tự chia thành ${{middle}} + ${{batchSymbols.length-middle}} mã...`);
+    const left = await requestAdaptive(batchSymbols.slice(0, middle), depth + 1);
+    const right = await requestAdaptive(batchSymbols.slice(middle), depth + 1);
+    return left.concat(right);
+  }}
+ 
+  return [{{
+    symbol: String(batchSymbols[0]).toUpperCase(),
+    status: "ERROR", count: 0, score: null,
+    first_time: null, last_time: null,
+    error: lastError ? lastError.message : "Unknown history request failure"
+  }}];
+}}
+ 
 async function main() {{
   try {{
     let state = loadState();
@@ -2083,38 +2142,17 @@ async function main() {{
         continue;
       }}
       show(`Đang xử lý batch ${{b+1}}/${{total}} (${{missing.length}} mã cần lấy dữ liệu)...\nKết quả đã lưu trên trình duyệt; có thể tiếp tục nếu gián đoạn.`);
-      let pending = missing.slice();
-      let lastError = null;
-      for (let attempt = 1; attempt <= 3 && pending.length; attempt++) {{
-        try {{
-          const response = await postJSON("/rs-batch-stateless", {{
-            symbols:pending, days:CFG.days, concurrency:CFG.concurrency
-          }});
-          if (response.status !== "BATCH_COMPLETE" || !Array.isArray(response.results)) {{
-            throw new Error(JSON.stringify(response));
-          }}
-          for (const item of response.results) bySymbol.set(String(item.symbol).toUpperCase(), item);
-          pending = pending.filter(s => {{
-            const saved = bySymbol.get(String(s).toUpperCase());
-            return !saved || saved.status === "ERROR";
-          }});
-          state.results = Array.from(bySymbol.values());
-          state.completedBatches = b;
-          saveState(state);
-          if (pending.length) {{
-            show(`Batch ${{b+1}}/${{total}} còn ${{pending.length}} mã lỗi; thử lại ${{attempt}}/3...`);
-            await sleep(1200 * attempt);
-          }}
-        }} catch(e) {{
-          lastError = e;
-          show(`Batch ${{b+1}}/${{total}} gặp lỗi, thử lại ${{attempt}}/3...\n${{e.message}}`);
-          await sleep(1500 * attempt);
-        }}
-      }}
+      const recoveredResults = await requestAdaptive(missing);
+      for (const item of recoveredResults) bySymbol.set(String(item.symbol).toUpperCase(), item);
+      const pending = missing.filter(sym => {{
+        const saved = bySymbol.get(String(sym).toUpperCase());
+        return !saved || saved.status === "ERROR";
+      }});
+      state.results = Array.from(bySymbol.values());
+      state.completedBatches = b;
+      saveState(state);
       if (pending.length) {{
-        state.results = Array.from(bySymbol.values());
-        saveState(state);
-        throw new Error(`Batch ${{b+1}} còn ${{pending.length}} mã lỗi sau 3 lần thử. Có thể mở lại cùng link để tiếp tục. ${{lastError ? lastError.message : ""}}`);
+        show(`Batch ${{b+1}}/${{total}} đã thử chia nhỏ; còn ${{pending.length}} mã lỗi. Lưu kết quả và tiếp tục các batch khác.`);
       }}
       state.results = Array.from(bySymbol.values());
       state.completedBatches = b + 1;
