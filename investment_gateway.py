@@ -1077,6 +1077,59 @@ async def _load_vci_symbols_only():
     }
  
  
+# Cache 10-session average volume to avoid refetching history on every /leaders call.
+_VOLUME_AVG10_CACHE = {}
+_VOLUME_AVG10_TTL_SECONDS = 900
+_VOLUME_AVG10_ERROR_TTL_SECONDS = 60
+ 
+ 
+async def _get_average_volume_10(symbol, semaphore):
+    """Return mean daily traded volume over the latest 10 valid sessions."""
+    now = time.monotonic()
+    cached = _VOLUME_AVG10_CACHE.get(symbol)
+    if cached:
+        cached_at, cached_value = cached
+        ttl = (
+            _VOLUME_AVG10_TTL_SECONDS
+            if cached_value is not None
+            else _VOLUME_AVG10_ERROR_TTL_SECONDS
+        )
+        if now - cached_at < ttl:
+            return cached_value
+ 
+    try:
+        async with semaphore:
+            candles = await asyncio.wait_for(
+                fetch_dnse_ohlcv(
+                    symbol=symbol,
+                    market="stock",
+                    resolution="1D",
+                    days=30,
+                ),
+                timeout=25,
+            )
+        candles = candles if isinstance(candles, list) else []
+        candles = [
+            item for item in candles
+            if isinstance(item, dict)
+            and item.get("volume") is not None
+            and _float(item.get("volume")) >= 0
+            and _float(item.get("close")) > 0
+        ]
+        candles.sort(key=lambda item: item.get("time", 0))
+        latest = candles[-10:]
+        average = (
+            sum(_float(item.get("volume")) for item in latest) / 10
+            if len(latest) == 10
+            else None
+        )
+        _VOLUME_AVG10_CACHE[symbol] = (time.monotonic(), average)
+        return average
+    except Exception:
+        _VOLUME_AVG10_CACHE[symbol] = (time.monotonic(), None)
+        return None
+ 
+ 
 @app.get("/leaders")
 async def leaders(
     top_n: int = Query(
@@ -1088,7 +1141,7 @@ async def leaders(
     min_volume: int = Query(
         100000,
         ge=0,
-        description="Thanh khoản phiên tối thiểu",
+        description="Khối lượng giao dịch bình quân 10 phiên tối thiểu",
     ),
     min_price: float = Query(
         10000,
@@ -1188,10 +1241,30 @@ async def leaders(
             min(100.0, (stats["breadth_score"] + 100) / 2),
         )
  
-    # Liquidity percentile from current session volume.
+    # Calculate 10-session average volume for each stock.
+    # Keep the Leader score formula and its weights unchanged.
+    volume_semaphore = asyncio.Semaphore(12)
+    volume_values = await asyncio.gather(
+        *(
+            _get_average_volume_10(stock["symbol"], volume_semaphore)
+            for stock in stocks
+        )
+    )
+    for stock, average_volume in zip(stocks, volume_values):
+        stock["volume_ma10"] = average_volume
+        stock["volume_source"] = (
+            "DNSE.history.volume_ma10"
+            if average_volume is not None
+            else "DNSE.history.volume_ma10_unavailable"
+        )
+ 
+    # Liquidity percentile is ranked using 10-session average volume.
     volume_stocks = sorted(
-        [stock for stock in stocks if stock["volume"] > 0],
-        key=lambda x: x["volume"],
+        [
+            stock for stock in stocks
+            if stock["volume_ma10"] is not None and stock["volume_ma10"] > 0
+        ],
+        key=lambda x: x["volume_ma10"],
     )
     volume_count = len(volume_stocks)
     volume_score = {}
@@ -1200,12 +1273,10 @@ async def leaders(
         if volume_count <= 1:
             percentile = 100.0
         else:
-            percentile = (
-                (rank - 1) / (volume_count - 1) * 100
-            )
+            percentile = (rank - 1) / (volume_count - 1) * 100
         volume_score[stock["symbol"]] = percentile
  
-    rs_map = RS_CACHE.get("by_symbol", {})
+        rs_map = RS_CACHE.get("by_symbol", {})
     eligible = []
  
     for stock in stocks:
@@ -1243,7 +1314,8 @@ async def leaders(
         stock["leader_score"] = round(leader_score, 2)
         stock["eligible_default"] = (
             stock["price"] >= min_price
-            and stock["volume"] >= min_volume
+            and stock["volume_ma10"] is not None
+            and stock["volume_ma10"] >= min_volume
         )
  
         if stock["eligible_default"]:
@@ -1264,6 +1336,10 @@ async def leaders(
             "price": stock["price"],
             "change_pct": stock["change_pct"],
             "volume": stock["volume"],
+            "average_volume_10_sessions": (
+                round(stock["volume_ma10"], 2)
+                if stock["volume_ma10"] is not None else None
+            ),
             "group": stock["group"],
             "icb_code": stock["icb_code"],
             "rs_rating": stock["rs_rating"],
@@ -1297,6 +1373,8 @@ async def leaders(
         "screen": {
             "min_price": min_price,
             "min_volume": min_volume,
+            "min_volume_basis": "average daily volume over latest 10 sessions",
+            "volume_average_sessions": 10,
         },
         "priced_stocks": len(stocks),
         "eligible_leader_stocks": len(eligible),
