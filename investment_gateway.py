@@ -4,7 +4,11 @@ from fastapi.responses import HTMLResponse
 import asyncio
 import time
 import json
-from pathlib import Path
+import os
+import base64
+import gzip
+import urllib.request
+import urllib.error
 import httpx
  
 from adapters.dnse import fetch_dnse_ohlcv
@@ -32,29 +36,145 @@ VCI_HEADERS = {
     "Origin": "https://trading.vietcap.com.vn",
 }
  
-RS_CHECKPOINT_PATH = Path("rs_batch_v4_checkpoint.json")
+# IMPORTANT: On Render, mount a Persistent Disk at /var/data.
+# The environment variable can override this path if your disk uses another mount.
+# GitHub checkpoint storage: compatible with Render Free (no persistent disk required).
+# Configure GITHUB_TOKEN in Render. These defaults match the Investment OS repository.
+GITHUB_REPO_OWNER = os.getenv("GITHUB_REPO_OWNER", "lavantuncktgt-arch")
+GITHUB_REPO_NAME = os.getenv("GITHUB_REPO_NAME", "investment-os-gateway")
+GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main")
+GITHUB_CHECKPOINT_PATH = os.getenv(
+    "GITHUB_CHECKPOINT_PATH", "data/rs_batch_v4_checkpoint.json.gz"
+)
+GITHUB_API_BASE = "https://api.github.com"
+ 
+ 
+def _github_contents_request(method, body=None):
+    """Call GitHub Contents API without exposing the token in errors/logs."""
+    token = os.getenv("GITHUB_TOKEN", "").strip()
+    if not token:
+        return None, "GITHUB_TOKEN is not configured"
+    url = (
+        f"{GITHUB_API_BASE}/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}"
+        f"/contents/{GITHUB_CHECKPOINT_PATH}"
+    )
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "Investment-OS-Gateway",
+    }
+    data = None
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(body).encode("utf-8")
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            raw = response.read()
+            return (json.loads(raw.decode("utf-8")) if raw else {}), None
+    except urllib.error.HTTPError as exc:
+        # A 404 is a normal first-run condition for GET and DELETE.
+        if exc.code == 404:
+            return None, "HTTP 404"
+        return None, f"GitHub API HTTP {exc.code}"
+    except Exception as exc:
+        return None, f"GitHub API request failed: {type(exc).__name__}"
  
  
 def _save_rs_checkpoint(all_results):
-    """Save the current RS batch state to a local JSON checkpoint."""
+    """Compress and save the complete RS checkpoint in the configured GitHub repo."""
     payload = {
+        "schema_version": 1,
         "saved_at": time.time(),
         "cache": {
-            key: value
-            for key, value in RS_CACHE.items()
-            if key not in ("rows", "by_symbol")
+            key: value for key, value in RS_CACHE.items()
+            if key not in ("rows", "by_symbol", "results")
         },
         "results": all_results,
     }
     try:
-        RS_CHECKPOINT_PATH.write_text(
-            json.dumps(payload, ensure_ascii=False),
-            encoding="utf-8",
+        compressed = gzip.compress(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         )
+        encoded = base64.b64encode(compressed).decode("ascii")
+        if len(compressed) > 900_000:
+            RS_CACHE["checkpoint_error"] = "Checkpoint vượt giới hạn an toàn 900 KB"
+            return False
+        existing, error = _github_contents_request("GET")
+        sha = existing.get("sha") if existing else None
+        if error not in (None, "HTTP 404"):
+            RS_CACHE["checkpoint_error"] = error
+            return False
+        body = {
+            "message": f"Investment OS: update RS checkpoint ({int(time.time())})",
+            "content": encoded,
+            "branch": GITHUB_BRANCH,
+        }
+        if sha:
+            body["sha"] = sha
+        saved, save_error = _github_contents_request("PUT", body)
+        if save_error or not saved or not saved.get("content", {}).get("sha"):
+            RS_CACHE["checkpoint_error"] = save_error or "GitHub did not confirm checkpoint commit"
+            return False
+        RS_CACHE["checkpoint_error"] = None
+        RS_CACHE["checkpoint_saved_at"] = payload["saved_at"]
         return True
-    except Exception:
+    except Exception as exc:
+        RS_CACHE["checkpoint_error"] = f"Checkpoint serialization failed: {type(exc).__name__}"
         return False
  
+ 
+def _restore_rs_checkpoint():
+    """Restore RS state from GitHub; never silently treat API errors as an empty checkpoint."""
+    global RS_CACHE
+    remote, error = _github_contents_request("GET")
+    if error == "HTTP 404":
+        RS_CACHE["checkpoint_error"] = "Chưa có checkpoint trên GitHub"
+        return False
+    if error:
+        RS_CACHE["checkpoint_error"] = error
+        return False
+    try:
+        content = remote.get("content", "")
+        compressed = base64.b64decode(content)
+        payload = json.loads(gzip.decompress(compressed).decode("utf-8"))
+        if payload.get("schema_version") != 1:
+            raise ValueError("Unsupported checkpoint schema")
+        cache = payload.get("cache")
+        results = payload.get("results")
+        if not isinstance(cache, dict) or not isinstance(results, list):
+            raise ValueError("Invalid checkpoint structure")
+        RS_CACHE.update(cache)
+        RS_CACHE["results"] = results
+        partial_rows = _build_rs_rows(results)
+        RS_CACHE["rows"] = partial_rows
+        RS_CACHE["by_symbol"] = {row["symbol"]: row for row in partial_rows}
+        RS_CACHE["checkpoint_error"] = None
+        RS_CACHE["checkpoint_saved_at"] = payload.get("saved_at")
+        return True
+    except Exception as exc:
+        RS_CACHE["checkpoint_error"] = f"Checkpoint restore failed: {type(exc).__name__}"
+        return False
+ 
+ 
+def _delete_rs_checkpoint():
+    """Delete the GitHub checkpoint when /rs-reset is explicitly requested."""
+    existing, error = _github_contents_request("GET")
+    if error == "HTTP 404":
+        return True
+    if error:
+        RS_CACHE["checkpoint_error"] = error
+        return False
+    deleted, delete_error = _github_contents_request("DELETE", {
+        "message": "Investment OS: reset RS checkpoint",
+        "sha": existing.get("sha"),
+        "branch": GITHUB_BRANCH,
+    })
+    if delete_error:
+        RS_CACHE["checkpoint_error"] = delete_error
+        return False
+    return True
  
 def _float(value, default=0.0):
     try:
@@ -1038,65 +1158,22 @@ async def _fetch_rs_history_one(symbol, semaphore, days):
             }
  
  
-async def _load_vci_symbols_only():
-    """Load the stock universe without fetching the current price board."""
-    async with httpx.AsyncClient(timeout=30) as client:
-        response = await client.get(
-            VCI_SYMBOLS_URL,
-            headers=VCI_HEADERS,
-        )
- 
-    if not response.is_success:
-        return {
-            "error": f"getAll failed: HTTP {response.status_code}"
-        }
- 
-    payload = response.json()
- 
-    if isinstance(payload, dict):
-        universe = payload.get("data", [])
-    elif isinstance(payload, list):
-        universe = payload
-    else:
-        universe = []
- 
-    symbols = []
-    for item in universe:
-        if not isinstance(item, dict):
-            continue
-        if item.get("type") != "STOCK":
-            continue
-        if item.get("board") not in ["HSX", "HNX", "UPCOM"]:
-            continue
-        symbol = item.get("symbol")
-        if symbol:
-            symbols.append(str(symbol).upper())
- 
-    return {
-        "symbols": list(dict.fromkeys(symbols))
-    }
  
  
-# Cache 10-session average volume to avoid refetching history on every /leaders call.
+# Cached 10-session average volume. Requires 10 valid daily candles.
 _VOLUME_AVG10_CACHE = {}
 _VOLUME_AVG10_TTL_SECONDS = 900
 _VOLUME_AVG10_ERROR_TTL_SECONDS = 60
  
  
 async def _get_average_volume_10(symbol, semaphore):
-    """Return mean daily traded volume over the latest 10 valid sessions."""
     now = time.monotonic()
     cached = _VOLUME_AVG10_CACHE.get(symbol)
     if cached:
         cached_at, cached_value = cached
-        ttl = (
-            _VOLUME_AVG10_TTL_SECONDS
-            if cached_value is not None
-            else _VOLUME_AVG10_ERROR_TTL_SECONDS
-        )
+        ttl = _VOLUME_AVG10_TTL_SECONDS if cached_value is not None else _VOLUME_AVG10_ERROR_TTL_SECONDS
         if now - cached_at < ttl:
             return cached_value
- 
     try:
         async with semaphore:
             candles = await asyncio.wait_for(
@@ -1118,11 +1195,7 @@ async def _get_average_volume_10(symbol, semaphore):
         ]
         candles.sort(key=lambda item: item.get("time", 0))
         latest = candles[-10:]
-        average = (
-            sum(_float(item.get("volume")) for item in latest) / 10
-            if len(latest) == 10
-            else None
-        )
+        average = sum(_float(item.get("volume")) for item in latest) / 10 if len(latest) == 10 else None
         _VOLUME_AVG10_CACHE[symbol] = (time.monotonic(), average)
         return average
     except Exception:
@@ -1241,39 +1314,26 @@ async def leaders(
             min(100.0, (stats["breadth_score"] + 100) / 2),
         )
  
-    # Calculate 10-session average volume for each stock.
-    # Keep the Leader score formula and its weights unchanged.
+    # Liquidity percentile uses average daily volume over the latest 10 sessions.
     volume_semaphore = asyncio.Semaphore(12)
     volume_values = await asyncio.gather(
-        *(
-            _get_average_volume_10(stock["symbol"], volume_semaphore)
-            for stock in stocks
-        )
+        *(_get_average_volume_10(stock["symbol"], volume_semaphore) for stock in stocks)
     )
     for stock, average_volume in zip(stocks, volume_values):
         stock["volume_ma10"] = average_volume
         stock["volume_source"] = (
-            "DNSE.history.volume_ma10"
-            if average_volume is not None
+            "DNSE.history.volume_ma10" if average_volume is not None
             else "DNSE.history.volume_ma10_unavailable"
         )
  
-    # Liquidity percentile is ranked using 10-session average volume.
     volume_stocks = sorted(
-        [
-            stock for stock in stocks
-            if stock["volume_ma10"] is not None and stock["volume_ma10"] > 0
-        ],
+        [stock for stock in stocks if stock["volume_ma10"] is not None and stock["volume_ma10"] > 0],
         key=lambda x: x["volume_ma10"],
     )
     volume_count = len(volume_stocks)
     volume_score = {}
- 
     for rank, stock in enumerate(volume_stocks, start=1):
-        if volume_count <= 1:
-            percentile = 100.0
-        else:
-            percentile = (rank - 1) / (volume_count - 1) * 100
+        percentile = 100.0 if volume_count <= 1 else (rank - 1) / (volume_count - 1) * 100
         volume_score[stock["symbol"]] = percentile
  
         rs_map = RS_CACHE.get("by_symbol", {})
@@ -1570,7 +1630,7 @@ async def _initialize_rs_batch_run(days=600, concurrency=8, limit=100, batch_siz
         "completed_batches": 0,
         "total_batches": len(batches),
         "last_batch_status": None,
-        "checkpoint_saved_at": None,
+        "checkpoint_saved_at": None, "checkpoint_error": None,
         "formula": {"3m": 0.40, "6m": 0.30, "9m": 0.20, "12m": 0.10},
         "minimum_candles": 251,
         "symbols": symbols,
@@ -1588,23 +1648,6 @@ async def _initialize_rs_batch_run(days=600, concurrency=8, limit=100, batch_siz
     return batches
  
  
-def _restore_rs_checkpoint():
-    """Restore the manual batch state from the local checkpoint if available."""
-    global RS_CACHE
-    if not RS_CHECKPOINT_PATH.exists():
-        return False
-    try:
-        payload = json.loads(RS_CHECKPOINT_PATH.read_text(encoding="utf-8"))
-        cache = payload.get("cache") or {}
-        results = payload.get("results") or []
-        RS_CACHE.update(cache)
-        RS_CACHE["results"] = results
-        partial_rows = _build_rs_rows(results)
-        RS_CACHE["rows"] = partial_rows
-        RS_CACHE["by_symbol"] = {row["symbol"]: row for row in partial_rows}
-        return True
-    except Exception:
-        return False
  
  
 async def _process_rs_batch(batch_number: int):
@@ -1851,7 +1894,7 @@ async def rs_status():
         "total_batches": RS_CACHE.get("total_batches", 0),
         "last_batch_status": RS_CACHE.get("last_batch_status"),
         "checkpoint_saved_at": RS_CACHE.get("checkpoint_saved_at"),
-        "checkpoint_file": str(RS_CHECKPOINT_PATH),
+        "checkpoint_file": f"GitHub:{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/{GITHUB_CHECKPOINT_PATH}",
         "minimum_candles": RS_CACHE.get("minimum_candles", 251),
         "formula": RS_CACHE.get("formula"),
         "vnindex_in_formula": False,
@@ -2266,10 +2309,8 @@ async def rs_reset():
     global RS_CACHE
     if RS_CACHE.get("status") in ("RUNNING_BATCH",):
         return {"status": "RUNNING", "message": "Cannot reset while a batch is running"}
-    try:
-        RS_CHECKPOINT_PATH.unlink(missing_ok=True)
-    except Exception:
-        pass
+    if not _delete_rs_checkpoint():
+        return {"status": "ERROR", "message": "Could not delete GitHub checkpoint", "detail": RS_CACHE.get("checkpoint_error")}
     RS_CACHE = {
         "status": "EMPTY", "ranking_status": "NOT_READY", "started_at": None,
         "finished_at": None, "elapsed_ms": None, "requested_symbols": 0,
@@ -2277,7 +2318,7 @@ async def rs_reset():
         "empty_symbols": 0, "insufficient_history_symbols": 0, "failed_symbols": 0,
         "days": 600, "concurrency": 8, "batch_size": 50, "current_batch": 0,
         "completed_batches": 0, "total_batches": 0, "last_batch_status": None,
-        "checkpoint_saved_at": None,
+        "checkpoint_saved_at": None, "checkpoint_error": None,
         "formula": {"3m": 0.40, "6m": 0.30, "9m": 0.20, "12m": 0.10},
         "minimum_candles": 251, "symbols": [], "rows": [], "by_symbol": {},
         "errors": [], "history_counts": [], "results": [],
@@ -2432,3 +2473,11 @@ async def rs_history_test(
         "elapsed_ms": elapsed_ms,
         "results": results,
     }
+ 
+@app.on_event("startup")
+async def _restore_rs_checkpoint_on_startup():
+    """Restore the last RS cache after a Render restart/deploy when disk persists."""
+    global RS_CACHE
+    if RS_CACHE.get("requested_symbols", 0) == 0:
+        _restore_rs_checkpoint()
+ 
