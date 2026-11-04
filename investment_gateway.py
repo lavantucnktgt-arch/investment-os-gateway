@@ -98,8 +98,12 @@ def _save_rs_checkpoint(all_results):
             json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         )
         encoded = base64.b64encode(compressed).decode("ascii")
-        if len(compressed) > 900_000:
-            RS_CACHE["checkpoint_error"] = "Checkpoint vượt giới hạn an toàn 900 KB"
+        # GitHub Contents API receives Base64 text inside JSON; guard the
+        # encoded payload (not only the compressed bytes) below 1 MB.
+        if len(encoded.encode("ascii")) > 950_000:
+            RS_CACHE["checkpoint_error"] = (
+                "Checkpoint Base64 vượt ngưỡng an toàn 950 KB của GitHub Contents API"
+            )
             return False
         existing, error = _github_contents_request("GET")
         sha = existing.get("sha") if existing else None
@@ -1850,11 +1854,13 @@ async def rs_finalize():
     RS_CACHE["elapsed_ms"] = round(
         (time.perf_counter() - started) * 1000, 1
     )
-    RS_CACHE["checkpoint_saved_at"] = time.time()
-    _save_rs_checkpoint(all_results)
+    checkpoint_ok = _save_rs_checkpoint(all_results)
  
     return {
         "status": RS_CACHE["status"],
+        "checkpoint_persisted": checkpoint_ok,
+        "checkpoint_saved_at": RS_CACHE.get("checkpoint_saved_at"),
+        "checkpoint_error": RS_CACHE.get("checkpoint_error"),
         "ranking_status": "FINAL",
         "requested_symbols": RS_CACHE["requested_symbols"],
         "processed_symbols": RS_CACHE["processed_symbols"],
@@ -1894,6 +1900,8 @@ async def rs_status():
         "total_batches": RS_CACHE.get("total_batches", 0),
         "last_batch_status": RS_CACHE.get("last_batch_status"),
         "checkpoint_saved_at": RS_CACHE.get("checkpoint_saved_at"),
+        "checkpoint_persisted": bool(RS_CACHE.get("checkpoint_saved_at")),
+        "checkpoint_error": RS_CACHE.get("checkpoint_error"),
         "checkpoint_file": f"GitHub:{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/{GITHUB_CHECKPOINT_PATH}",
         "minimum_candles": RS_CACHE.get("minimum_candles", 251),
         "formula": RS_CACHE.get("formula"),
@@ -2064,11 +2072,13 @@ async def rs_finalize_client(payload: RSFinalizeRequest):
         "history_counts": [r.get("count", 0) for r in ordered_results if r.get("count", 0) > 0],
         "results": ordered_results,
     }
-    # Save local checkpoint opportunistically; browser localStorage remains the
-    # source of truth for recovery if the hosting instance restarts.
-    _save_rs_checkpoint(ordered_results)
+    # GitHub is the durable checkpoint for Render Free (ephemeral local disk).
+    checkpoint_ok = _save_rs_checkpoint(ordered_results)
     return {
         "status": RS_CACHE["status"],
+        "checkpoint_persisted": checkpoint_ok,
+        "checkpoint_saved_at": RS_CACHE.get("checkpoint_saved_at"),
+        "checkpoint_error": RS_CACHE.get("checkpoint_error"),
         "ranking_status": "FINAL",
         "requested_symbols": completed,
         "processed_symbols": completed,
