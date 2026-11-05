@@ -74,14 +74,59 @@ def _github_contents_request(method, body=None):
             raw = response.read()
             return (json.loads(raw.decode("utf-8")) if raw else {}), None
     except urllib.error.HTTPError as exc:
-        # A 404 is a normal first-run condition for GET and DELETE.
-        if exc.code == 404:
+        # Preserve the HTTP method and GitHub's safe message; never expose headers/token.
+        try:
+            raw_error = exc.read().decode("utf-8", errors="replace")
+            parsed_error = json.loads(raw_error) if raw_error else {}
+            api_message = str(parsed_error.get("message", ""))[:180]
+        except Exception:
+            api_message = ""
+        if exc.code == 404 and method in ("GET", "DELETE"):
             return None, "HTTP 404"
-        return None, f"GitHub API HTTP {exc.code}"
+        detail = f"GitHub API HTTP {exc.code} ({method})"
+        if api_message:
+            detail += f": {api_message}"
+        return None, detail
     except Exception as exc:
-        return None, f"GitHub API request failed: {type(exc).__name__}"
+        return None, f"GitHub API request failed ({method}): {type(exc).__name__}"
  
  
+def _github_preflight():
+    """Verify that the configured token can read the repository and target branch."""
+    token = os.getenv("GITHUB_TOKEN", "").strip()
+    if not token:
+        return "GITHUB_TOKEN is not configured"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "Investment-OS-Gateway",
+    }
+    checks = (
+        (f"{GITHUB_API_BASE}/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}", "repository"),
+        (f"{GITHUB_API_BASE}/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/branches/{GITHUB_BRANCH}", "branch"),
+    )
+    for url, label in checks:
+        request = urllib.request.Request(url, headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                response.read()
+        except urllib.error.HTTPError as exc:
+            try:
+                raw = exc.read().decode("utf-8", errors="replace")
+                parsed = json.loads(raw) if raw else {}
+                message = str(parsed.get("message", ""))[:180]
+            except Exception:
+                message = ""
+            detail = f"GitHub preflight {label} failed: HTTP {exc.code}"
+            if message:
+                detail += f": {message}"
+            return detail
+        except Exception as exc:
+            return f"GitHub preflight {label} request failed: {type(exc).__name__}"
+    return None
+
+
 def _save_rs_checkpoint(all_results):
     """Compress and save the complete RS checkpoint in the configured GitHub repo."""
     payload = {
@@ -105,10 +150,16 @@ def _save_rs_checkpoint(all_results):
                 "Checkpoint Base64 vượt ngưỡng an toàn 950 KB của GitHub Contents API"
             )
             return False
+        preflight_error = _github_preflight()
+        if preflight_error:
+            RS_CACHE["checkpoint_persisted"] = False
+            RS_CACHE["checkpoint_error"] = preflight_error
+            return False
         existing, error = _github_contents_request("GET")
         sha = existing.get("sha") if existing else None
         if error not in (None, "HTTP 404"):
-            RS_CACHE["checkpoint_error"] = error
+            RS_CACHE["checkpoint_persisted"] = False
+            RS_CACHE["checkpoint_error"] = f"Checkpoint lookup failed: {error}"
             return False
         body = {
             "message": f"Investment OS: update RS checkpoint ({int(time.time())})",
@@ -119,12 +170,17 @@ def _save_rs_checkpoint(all_results):
             body["sha"] = sha
         saved, save_error = _github_contents_request("PUT", body)
         if save_error or not saved or not saved.get("content", {}).get("sha"):
-            RS_CACHE["checkpoint_error"] = save_error or "GitHub did not confirm checkpoint commit"
+            RS_CACHE["checkpoint_persisted"] = False
+            RS_CACHE["checkpoint_error"] = (
+                f"Checkpoint PUT failed: {save_error or 'GitHub did not confirm checkpoint commit'}"
+            )
             return False
+        RS_CACHE["checkpoint_persisted"] = True
         RS_CACHE["checkpoint_error"] = None
         RS_CACHE["checkpoint_saved_at"] = payload["saved_at"]
         return True
     except Exception as exc:
+        RS_CACHE["checkpoint_persisted"] = False
         RS_CACHE["checkpoint_error"] = f"Checkpoint serialization failed: {type(exc).__name__}"
         return False
  
@@ -134,10 +190,12 @@ def _restore_rs_checkpoint():
     global RS_CACHE
     remote, error = _github_contents_request("GET")
     if error == "HTTP 404":
+        RS_CACHE["checkpoint_persisted"] = False
         RS_CACHE["checkpoint_error"] = "Chưa có checkpoint trên GitHub"
         return False
     if error:
-        RS_CACHE["checkpoint_error"] = error
+        RS_CACHE["checkpoint_persisted"] = False
+        RS_CACHE["checkpoint_error"] = f"Checkpoint restore failed: {error}"
         return False
     try:
         content = remote.get("content", "")
@@ -154,10 +212,12 @@ def _restore_rs_checkpoint():
         partial_rows = _build_rs_rows(results)
         RS_CACHE["rows"] = partial_rows
         RS_CACHE["by_symbol"] = {row["symbol"]: row for row in partial_rows}
+        RS_CACHE["checkpoint_persisted"] = True
         RS_CACHE["checkpoint_error"] = None
         RS_CACHE["checkpoint_saved_at"] = payload.get("saved_at")
         return True
     except Exception as exc:
+        RS_CACHE["checkpoint_persisted"] = False
         RS_CACHE["checkpoint_error"] = f"Checkpoint restore failed: {type(exc).__name__}"
         return False
  
@@ -1634,7 +1694,7 @@ async def _initialize_rs_batch_run(days=600, concurrency=8, limit=100, batch_siz
         "completed_batches": 0,
         "total_batches": len(batches),
         "last_batch_status": None,
-        "checkpoint_saved_at": None, "checkpoint_error": None,
+        "checkpoint_saved_at": None, "checkpoint_persisted": False, "checkpoint_error": None,
         "formula": {"3m": 0.40, "6m": 0.30, "9m": 0.20, "12m": 0.10},
         "minimum_candles": 251,
         "symbols": symbols,
@@ -1900,7 +1960,7 @@ async def rs_status():
         "total_batches": RS_CACHE.get("total_batches", 0),
         "last_batch_status": RS_CACHE.get("last_batch_status"),
         "checkpoint_saved_at": RS_CACHE.get("checkpoint_saved_at"),
-        "checkpoint_persisted": bool(RS_CACHE.get("checkpoint_saved_at")),
+        "checkpoint_persisted": bool(RS_CACHE.get("checkpoint_persisted", False)),
         "checkpoint_error": RS_CACHE.get("checkpoint_error"),
         "checkpoint_file": f"GitHub:{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/{GITHUB_CHECKPOINT_PATH}",
         "minimum_candles": RS_CACHE.get("minimum_candles", 251),
@@ -2059,7 +2119,9 @@ async def rs_finalize_client(payload: RSFinalizeRequest):
         "completed_batches": total_batches,
         "total_batches": total_batches,
         "last_batch_status": "OK",
-        "checkpoint_saved_at": time.time(),
+        "checkpoint_saved_at": None,
+        "checkpoint_persisted": False,
+        "checkpoint_error": None,
         "formula": {"3m": 0.40, "6m": 0.30, "9m": 0.20, "12m": 0.10},
         "minimum_candles": 251,
         "symbols": symbols,
@@ -2328,7 +2390,7 @@ async def rs_reset():
         "empty_symbols": 0, "insufficient_history_symbols": 0, "failed_symbols": 0,
         "days": 600, "concurrency": 8, "batch_size": 50, "current_batch": 0,
         "completed_batches": 0, "total_batches": 0, "last_batch_status": None,
-        "checkpoint_saved_at": None, "checkpoint_error": None,
+        "checkpoint_saved_at": None, "checkpoint_persisted": False, "checkpoint_error": None,
         "formula": {"3m": 0.40, "6m": 0.30, "9m": 0.20, "12m": 0.10},
         "minimum_candles": 251, "symbols": [], "rows": [], "by_symbol": {},
         "errors": [], "history_counts": [], "results": [],
@@ -2491,3 +2553,4 @@ async def _restore_rs_checkpoint_on_startup():
     if RS_CACHE.get("requested_symbols", 0) == 0:
         _restore_rs_checkpoint()
  
+
