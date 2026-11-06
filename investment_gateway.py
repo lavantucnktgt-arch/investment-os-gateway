@@ -91,6 +91,83 @@ def _github_contents_request(method, body=None):
         return None, f"GitHub API request failed ({method}): {type(exc).__name__}"
  
  
+def _github_diagnostic_check(url, label, token):
+    """Return a safe GitHub API diagnostic without exposing credentials."""
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "Investment-OS-Gateway-Diagnostic",
+    }
+    request = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            response.read()
+            return {"check": label, "http_status": response.status, "ok": True, "message": "OK"}
+    except urllib.error.HTTPError as exc:
+        try:
+            raw = exc.read().decode("utf-8", errors="replace")
+            parsed = json.loads(raw) if raw else {}
+            message = str(parsed.get("message", ""))[:180]
+        except Exception:
+            message = ""
+        return {
+            "check": label,
+            "http_status": exc.code,
+            "ok": False,
+            "message": message or "GitHub API returned an HTTP error",
+        }
+    except Exception as exc:
+        return {
+            "check": label,
+            "http_status": None,
+            "ok": False,
+            "message": f"Request failed: {type(exc).__name__}",
+        }
+ 
+ 
+@app.get("/github-diagnose")
+def github_diagnose():
+    """Read-only diagnostic for GitHub checkpoint configuration; never returns the token."""
+    token = os.getenv("GITHUB_TOKEN", "").strip()
+    result = {
+        "status": "ERROR",
+        "token_configured": bool(token),
+        "token_type_hint": (
+            "fine-grained PAT" if token.startswith("github_pat_")
+            else "classic PAT or other token" if token else "missing"
+        ),
+        "repository_owner": GITHUB_REPO_OWNER,
+        "repository_name": GITHUB_REPO_NAME,
+        "branch": GITHUB_BRANCH,
+        "checkpoint_path": GITHUB_CHECKPOINT_PATH,
+        "api_base": GITHUB_API_BASE,
+        "checks": [],
+        "security_note": "Token value and authorization headers are never returned.",
+    }
+    if not token:
+        result["checks"].append({
+            "check": "token", "http_status": None, "ok": False,
+            "message": "GITHUB_TOKEN is missing in Render environment",
+        })
+        return result
+ 
+    base = f"{GITHUB_API_BASE}/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}"
+    checks = [
+        (base, "repository access"),
+        (f"{base}/branches/{GITHUB_BRANCH}", "branch access"),
+        (f"{base}/contents/{GITHUB_CHECKPOINT_PATH}?ref={GITHUB_BRANCH}", "checkpoint file access"),
+    ]
+    for url, label in checks:
+        check = _github_diagnostic_check(url, label, token)
+        result["checks"].append(check)
+        # A failed repository/branch check makes later checks less useful.
+        if not check["ok"] and label != "checkpoint file access":
+            break
+    result["status"] = "OK" if all(item["ok"] for item in result["checks"][:2]) else "ERROR"
+    return result
+ 
+ 
 def _github_preflight():
     """Verify that the configured token can read the repository and target branch."""
     token = os.getenv("GITHUB_TOKEN", "").strip()
@@ -125,8 +202,8 @@ def _github_preflight():
         except Exception as exc:
             return f"GitHub preflight {label} request failed: {type(exc).__name__}"
     return None
-
-
+ 
+ 
 def _save_rs_checkpoint(all_results):
     """Compress and save the complete RS checkpoint in the configured GitHub repo."""
     payload = {
@@ -2553,4 +2630,3 @@ async def _restore_rs_checkpoint_on_startup():
     if RS_CACHE.get("requested_symbols", 0) == 0:
         _restore_rs_checkpoint()
  
-
