@@ -36,10 +36,10 @@ VCI_HEADERS = {
 # The browser runner stores intermediate batches in browser localStorage and
 # posts completed results to /rs-finalize-client. Leaders must run immediately
 # after RS finalization because Render Free RAM is ephemeral.
-CHECKPOINT_MODE = "DISABLED_TEMPORARILY"
+CHECKPOINT_MODE = "DISABLED_TEMPORARILY"  # RAM-only hotfix: RS must not depend on GitHub
  
 def _save_rs_checkpoint(all_results):
-    """No-op: GitHub checkpoint persistence is intentionally disabled."""
+    """Record RAM-only mode; never contact GitHub or claim persistence."""
     RS_CACHE["checkpoint_persisted"] = False
     RS_CACHE["checkpoint_saved_at"] = None
     RS_CACHE["checkpoint_error"] = (
@@ -1521,10 +1521,10 @@ async def _initialize_rs_batch_run(days=600, concurrency=8, limit=100, batch_siz
         "results": [],
     }
  
-    if not _save_rs_checkpoint([]):
-        raise RuntimeError("Could not save RS checkpoint")
- 
-    RS_CACHE["checkpoint_saved_at"] = time.time()
+    # RAM-only mode: checkpoint persistence is intentionally skipped.
+    # Do not block RS initialization because the no-op saver returns False.
+    _save_rs_checkpoint([])
+    RS_CACHE["checkpoint_saved_at"] = None
     return batches
  
  
@@ -1617,10 +1617,10 @@ async def _process_rs_batch(batch_number: int):
             {"symbol": item["symbol"], "error": item.get("error")}
             for item in all_results if item.get("status") == "ERROR"
         ][:50]
-        RS_CACHE["checkpoint_saved_at"] = time.time()
-        if not _save_rs_checkpoint(all_results):
-            RS_CACHE["last_batch_status"] = "CHECKPOINT_FAILED"
-            RS_CACHE["errors"].append({"error": "Checkpoint save failed"})
+        # RAM-only mode: keep results in RS_CACHE; checkpoint is deliberately skipped.
+        _save_rs_checkpoint(all_results)
+        RS_CACHE["checkpoint_saved_at"] = None
+        RS_CACHE["checkpoint_persisted"] = False
  
         batch_elapsed = round((time.perf_counter() - started) * 1000, 1)
         next_batch = batch_number + 1 if batch_number < total_batches else None
