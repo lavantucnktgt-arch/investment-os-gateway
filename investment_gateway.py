@@ -5,6 +5,10 @@ import asyncio
 import time
 import json
 import os
+import base64
+import gzip
+import urllib.request
+import urllib.error
 import httpx
  
 from adapters.dnse import fetch_dnse_ohlcv
@@ -32,29 +36,209 @@ VCI_HEADERS = {
     "Origin": "https://trading.vietcap.com.vn",
 }
  
-# RS checkpoint persistence is intentionally disabled for this deployment.
-# The browser runner stores intermediate batches in browser localStorage and
-# posts completed results to /rs-finalize-client. Leaders must run immediately
-# after RS finalization because Render Free RAM is ephemeral.
-CHECKPOINT_MODE = "DISABLED_TEMPORARILY"  # RAM-only hotfix: RS must not depend on GitHub
+# IMPORTANT: On Render, mount a Persistent Disk at /var/data.
+# The environment variable can override this path if your disk uses another mount.
+# GitHub checkpoint storage: compatible with Render Free (no persistent disk required).
+# Configure GITHUB_TOKEN in Render. These defaults match the Investment OS repository.
+GITHUB_REPO_OWNER = os.getenv("GITHUB_REPO_OWNER", "lavantuncktgt-arch")
+GITHUB_REPO_NAME = os.getenv("GITHUB_REPO_NAME", "investment-os-gateway")
+GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main")
+GITHUB_CHECKPOINT_PATH = os.getenv(
+    "GITHUB_CHECKPOINT_PATH", "data/rs_batch_v4_checkpoint.json.gz"
+)
+GITHUB_API_BASE = "https://api.github.com"
+ 
+ 
+def _github_contents_request(method, body=None):
+    """Call GitHub Contents API without exposing the token in errors/logs."""
+    token = os.getenv("GITHUB_TOKEN", "").strip()
+    if not token:
+        return None, "GITHUB_TOKEN is not configured"
+    url = (
+        f"{GITHUB_API_BASE}/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}"
+        f"/contents/{GITHUB_CHECKPOINT_PATH}"
+    )
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "Investment-OS-Gateway",
+    }
+    data = None
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(body).encode("utf-8")
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            raw = response.read()
+            return (json.loads(raw.decode("utf-8")) if raw else {}), None
+    except urllib.error.HTTPError as exc:
+        # Preserve the HTTP method and GitHub's safe message; never expose headers/token.
+        try:
+            raw_error = exc.read().decode("utf-8", errors="replace")
+            parsed_error = json.loads(raw_error) if raw_error else {}
+            api_message = str(parsed_error.get("message", ""))[:180]
+        except Exception:
+            api_message = ""
+        if exc.code == 404 and method in ("GET", "DELETE"):
+            return None, "HTTP 404"
+        detail = f"GitHub API HTTP {exc.code} ({method})"
+        if api_message:
+            detail += f": {api_message}"
+        return None, detail
+    except Exception as exc:
+        return None, f"GitHub API request failed ({method}): {type(exc).__name__}"
+ 
+ 
+def _github_preflight():
+    """Verify that the configured token can read the repository and target branch."""
+    token = os.getenv("GITHUB_TOKEN", "").strip()
+    if not token:
+        return "GITHUB_TOKEN is not configured"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "Investment-OS-Gateway",
+    }
+    checks = (
+        (f"{GITHUB_API_BASE}/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}", "repository"),
+        (f"{GITHUB_API_BASE}/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/branches/{GITHUB_BRANCH}", "branch"),
+    )
+    for url, label in checks:
+        request = urllib.request.Request(url, headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                response.read()
+        except urllib.error.HTTPError as exc:
+            try:
+                raw = exc.read().decode("utf-8", errors="replace")
+                parsed = json.loads(raw) if raw else {}
+                message = str(parsed.get("message", ""))[:180]
+            except Exception:
+                message = ""
+            detail = f"GitHub preflight {label} failed: HTTP {exc.code}"
+            if message:
+                detail += f": {message}"
+            return detail
+        except Exception as exc:
+            return f"GitHub preflight {label} request failed: {type(exc).__name__}"
+    return None
+ 
  
 def _save_rs_checkpoint(all_results):
-    """Record RAM-only mode; never contact GitHub or claim persistence."""
-    RS_CACHE["checkpoint_persisted"] = False
-    RS_CACHE["checkpoint_saved_at"] = None
-    RS_CACHE["checkpoint_error"] = (
-        "GitHub checkpoint tạm thời đã được tắt; dữ liệu RS chỉ nằm trong RAM Render."
-    )
-    return False
+    """Compress and save the complete RS checkpoint in the configured GitHub repo."""
+    payload = {
+        "schema_version": 1,
+        "saved_at": time.time(),
+        "cache": {
+            key: value for key, value in RS_CACHE.items()
+            if key not in ("rows", "by_symbol", "results")
+        },
+        "results": all_results,
+    }
+    try:
+        compressed = gzip.compress(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        )
+        encoded = base64.b64encode(compressed).decode("ascii")
+        # GitHub Contents API receives Base64 text inside JSON; guard the
+        # encoded payload (not only the compressed bytes) below 1 MB.
+        if len(encoded.encode("ascii")) > 950_000:
+            RS_CACHE["checkpoint_error"] = (
+                "Checkpoint Base64 vượt ngưỡng an toàn 950 KB của GitHub Contents API"
+            )
+            return False
+        preflight_error = _github_preflight()
+        if preflight_error:
+            RS_CACHE["checkpoint_persisted"] = False
+            RS_CACHE["checkpoint_error"] = preflight_error
+            return False
+        existing, error = _github_contents_request("GET")
+        sha = existing.get("sha") if existing else None
+        if error not in (None, "HTTP 404"):
+            RS_CACHE["checkpoint_persisted"] = False
+            RS_CACHE["checkpoint_error"] = f"Checkpoint lookup failed: {error}"
+            return False
+        body = {
+            "message": f"Investment OS: update RS checkpoint ({int(time.time())})",
+            "content": encoded,
+            "branch": GITHUB_BRANCH,
+        }
+        if sha:
+            body["sha"] = sha
+        saved, save_error = _github_contents_request("PUT", body)
+        if save_error or not saved or not saved.get("content", {}).get("sha"):
+            RS_CACHE["checkpoint_persisted"] = False
+            RS_CACHE["checkpoint_error"] = (
+                f"Checkpoint PUT failed: {save_error or 'GitHub did not confirm checkpoint commit'}"
+            )
+            return False
+        RS_CACHE["checkpoint_persisted"] = True
+        RS_CACHE["checkpoint_error"] = None
+        RS_CACHE["checkpoint_saved_at"] = payload["saved_at"]
+        return True
+    except Exception as exc:
+        RS_CACHE["checkpoint_persisted"] = False
+        RS_CACHE["checkpoint_error"] = f"Checkpoint serialization failed: {type(exc).__name__}"
+        return False
+ 
  
 def _restore_rs_checkpoint():
-    """No-op: never attempt GitHub restore in temporary RAM-only mode."""
-    return False
+    """Restore RS state from GitHub; never silently treat API errors as an empty checkpoint."""
+    global RS_CACHE
+    remote, error = _github_contents_request("GET")
+    if error == "HTTP 404":
+        RS_CACHE["checkpoint_persisted"] = False
+        RS_CACHE["checkpoint_error"] = "Chưa có checkpoint trên GitHub"
+        return False
+    if error:
+        RS_CACHE["checkpoint_persisted"] = False
+        RS_CACHE["checkpoint_error"] = f"Checkpoint restore failed: {error}"
+        return False
+    try:
+        content = remote.get("content", "")
+        compressed = base64.b64decode(content)
+        payload = json.loads(gzip.decompress(compressed).decode("utf-8"))
+        if payload.get("schema_version") != 1:
+            raise ValueError("Unsupported checkpoint schema")
+        cache = payload.get("cache")
+        results = payload.get("results")
+        if not isinstance(cache, dict) or not isinstance(results, list):
+            raise ValueError("Invalid checkpoint structure")
+        RS_CACHE.update(cache)
+        RS_CACHE["results"] = results
+        partial_rows = _build_rs_rows(results)
+        RS_CACHE["rows"] = partial_rows
+        RS_CACHE["by_symbol"] = {row["symbol"]: row for row in partial_rows}
+        RS_CACHE["checkpoint_persisted"] = True
+        RS_CACHE["checkpoint_error"] = None
+        RS_CACHE["checkpoint_saved_at"] = payload.get("saved_at")
+        return True
+    except Exception as exc:
+        RS_CACHE["checkpoint_persisted"] = False
+        RS_CACHE["checkpoint_error"] = f"Checkpoint restore failed: {type(exc).__name__}"
+        return False
+ 
  
 def _delete_rs_checkpoint():
-    """No-op: reset does not contact GitHub in temporary RAM-only mode."""
+    """Delete the GitHub checkpoint when /rs-reset is explicitly requested."""
+    existing, error = _github_contents_request("GET")
+    if error == "HTTP 404":
+        return True
+    if error:
+        RS_CACHE["checkpoint_error"] = error
+        return False
+    deleted, delete_error = _github_contents_request("DELETE", {
+        "message": "Investment OS: reset RS checkpoint",
+        "sha": existing.get("sha"),
+        "branch": GITHUB_BRANCH,
+    })
+    if delete_error:
+        RS_CACHE["checkpoint_error"] = delete_error
+        return False
     return True
- 
  
 def _float(value, default=0.0):
     try:
@@ -1040,291 +1224,154 @@ async def _fetch_rs_history_one(symbol, semaphore, days):
  
  
  
-# Cached 10-session average volume. Requires 10 valid daily candles.
-_VOLUME_AVG10_CACHE = {}
-_VOLUME_AVG10_TTL_SECONDS = 900
-_VOLUME_AVG10_ERROR_TTL_SECONDS = 60
+# Leaders V7: same-stock traded-value proxy (price x volume), not market percentile.
+# The proxy is NOT exact exchange turnover. Never label it as exact GTGD.
+from datetime import datetime, timezone, timedelta, date
+ 
+_VALUE10_CACHE = {}
+_VALUE10_TTL_SECONDS = 900
+_VALUE10_ERROR_TTL_SECONDS = 60
+_VN_TZ = timezone(timedelta(hours=7))
  
  
-async def _get_average_volume_10(symbol, semaphore):
+def _candle_session_date(candle):
+    raw = candle.get("time")
+    if isinstance(raw, (int, float)):
+        stamp = float(raw)
+        if stamp > 1e11:
+            stamp /= 1000
+        try:
+            return datetime.fromtimestamp(stamp, tz=_VN_TZ).date()
+        except (ValueError, OverflowError, OSError):
+            return None
+    if isinstance(raw, str):
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00")).date()
+        except ValueError:
+            return None
+    return None
+ 
+ 
+async def _get_previous_10_session_value(symbol, semaphore):
     now = time.monotonic()
-    cached = _VOLUME_AVG10_CACHE.get(symbol)
+    cached = _VALUE10_CACHE.get(symbol)
     if cached:
         cached_at, cached_value = cached
-        ttl = _VOLUME_AVG10_TTL_SECONDS if cached_value is not None else _VOLUME_AVG10_ERROR_TTL_SECONDS
+        ttl = _VALUE10_TTL_SECONDS if cached_value is not None else _VALUE10_ERROR_TTL_SECONDS
         if now - cached_at < ttl:
             return cached_value
     try:
         async with semaphore:
             candles = await asyncio.wait_for(
-                fetch_dnse_ohlcv(
-                    symbol=symbol,
-                    market="stock",
-                    resolution="1D",
-                    days=30,
-                ),
+                fetch_dnse_ohlcv(symbol=symbol, market="stock", resolution="1D", days=40),
                 timeout=25,
             )
-        candles = candles if isinstance(candles, list) else []
-        candles = [
-            item for item in candles
-            if isinstance(item, dict)
-            and item.get("volume") is not None
-            and _float(item.get("volume")) >= 0
-            and _float(item.get("close")) > 0
-        ]
-        candles.sort(key=lambda item: item.get("time", 0))
-        latest = candles[-10:]
-        average = sum(_float(item.get("volume")) for item in latest) / 10 if len(latest) == 10 else None
-        _VOLUME_AVG10_CACHE[symbol] = (time.monotonic(), average)
-        return average
+        today = datetime.now(_VN_TZ).date()
+        by_date = {}
+        for candle in candles if isinstance(candles, list) else []:
+            if not isinstance(candle, dict):
+                continue
+            session_date = _candle_session_date(candle)
+            close = _float(candle.get("close"))
+            volume = _float(candle.get("volume"), -1)
+            # Exclude today's (potentially unfinished) candle, future and malformed data.
+            if session_date is None or session_date >= today or close <= 0 or volume < 0:
+                continue
+            by_date[session_date] = close * volume
+        values = [by_date[d] for d in sorted(by_date)[-10:]]
+        result = sum(values) / 10 if len(values) == 10 else None
+        _VALUE10_CACHE[symbol] = (time.monotonic(), result)
+        return result
     except Exception:
-        _VOLUME_AVG10_CACHE[symbol] = (time.monotonic(), None)
+        _VALUE10_CACHE[symbol] = (time.monotonic(), None)
         return None
  
  
 @app.get("/leaders")
 async def leaders(
-    top_n: int = Query(
-        20,
-        ge=5,
-        le=50,
-        description="Số cổ phiếu dẫn dắt trả về",
-    ),
-    min_volume: int = Query(
-        100000,
-        ge=0,
-        description="Khối lượng giao dịch bình quân 10 phiên tối thiểu",
-    ),
-    min_price: float = Query(
-        10000,
-        ge=0,
-        description="Thị giá tối thiểu",
-    ),
+    top_n: int = Query(20, ge=5, le=50, description="Số cổ phiếu dẫn dắt trả về"),
+    min_value_billion: float = Query(10, ge=0, description="GTGD ước tính bình quân 10 phiên trước, tỷ VND"),
+    min_price: float = Query(10000, ge=0, description="Thị giá tối thiểu, VND"),
 ):
-    """
-    Leader V3.
+    """Leaders = 60% normalized RS + 40% own-history liquidity ratio.
  
-    Locked formula:
-      RS Rating O'Neil 40%
-      Liquidity percentile 30%
-      Group strength 30%
- 
-    RS must already exist in RS_CACHE. No VN-Index comparison is used
-    in the RS component.
+    Liquidity ratio = estimated current turnover / mean estimated turnover
+    of the 10 PREVIOUS completed sessions; estimated turnover = price * volume.
     """
     if RS_CACHE.get("status") not in ("OK", "PARTIAL"):
         return {
-            "source": "Investment OS",
-            "status": "DATA_INSUFFICIENT",
-            "version": "LEADER_V5",
-            "reason": "O'Neil RS cache is not ready",
-            "next": "Run /rs-refresh and wait for /rs-status",
+            "source": "Investment OS", "status": "DATA_INSUFFICIENT",
+            "version": "LEADER_V7_RS60_VALUE_RATIO40",
+            "reason": "RS cache is not ready", "next": "Check /rs-status",
         }
  
     data = await _load_vci_stock_prices()
- 
     if "error" in data:
-        return {
-            "source": "VCI",
-            "status": "ERROR",
-            "error": data["error"],
-        }
- 
-    async with httpx.AsyncClient(timeout=30) as client:
-        icb = await _load_vci_icb_mapping(client, level=2)
- 
-    mapping = icb["mapping"]
- 
-    symbol_to_code = {}
-    for item in data.get("universe_items", []):
-        if not isinstance(item, dict):
-            continue
-        symbol = item.get("symbol")
-        code = _extract_icb_code(item)
-        if symbol and code:
-            symbol_to_code[str(symbol).upper()] = code
+        return {"source": "VCI", "status": "ERROR", "error": data["error"]}
  
     stocks = []
     for item in data["prices"]:
         row = _extract_stock_row(item)
-        if not row:
-            continue
+        if row:
+            row["symbol"] = str(row["symbol"]).upper()
+            stocks.append(row)
  
-        symbol = str(row["symbol"]).upper()
-        code = symbol_to_code.get(symbol)
- 
-        if code:
-            group_name = mapping.get(code) or f"ICB {code}"
-        else:
-            group_name = "UNKNOWN"
- 
-        row["symbol"] = symbol
-        row["icb_code"] = code
-        row["group"] = group_name
-        stocks.append(row)
- 
-    # Group breadth score from current cross-section.
-    group_stats = {}
-    for stock in stocks:
-        group = stock["group"]
-        stats = group_stats.setdefault(
-            group,
-            {
-                "stocks": 0,
-                "advances": 0,
-                "declines": 0,
-            },
-        )
-        stats["stocks"] += 1
-        if stock["change_pct"] > 0:
-            stats["advances"] += 1
-        elif stock["change_pct"] < 0:
-            stats["declines"] += 1
- 
-    for stats in group_stats.values():
-        count = stats["stocks"]
-        stats["breadth_score"] = (
-            (stats["advances"] - stats["declines"]) / count * 100
-            if count else 0.0
-        )
-        # Normalize -100..+100 to 0..100.
-        stats["group_score"] = max(
-            0.0,
-            min(100.0, (stats["breadth_score"] + 100) / 2),
-        )
- 
-    # Liquidity percentile uses average daily volume over the latest 10 sessions.
-    volume_semaphore = asyncio.Semaphore(12)
-    volume_values = await asyncio.gather(
-        *(_get_average_volume_10(stock["symbol"], volume_semaphore) for stock in stocks)
-    )
-    for stock, average_volume in zip(stocks, volume_values):
-        stock["volume_ma10"] = average_volume
-        stock["volume_source"] = (
-            "DNSE.history.volume_ma10" if average_volume is not None
-            else "DNSE.history.volume_ma10_unavailable"
-        )
- 
-    volume_stocks = sorted(
-        [stock for stock in stocks if stock["volume_ma10"] is not None and stock["volume_ma10"] > 0],
-        key=lambda x: x["volume_ma10"],
-    )
-    volume_count = len(volume_stocks)
-    volume_score = {}
-    for rank, stock in enumerate(volume_stocks, start=1):
-        percentile = 100.0 if volume_count <= 1 else (rank - 1) / (volume_count - 1) * 100
-        volume_score[stock["symbol"]] = percentile
- 
-        rs_map = RS_CACHE.get("by_symbol", {})
+    semaphore = asyncio.Semaphore(12)
+    averages = await asyncio.gather(*(
+        _get_previous_10_session_value(stock["symbol"], semaphore)
+        for stock in stocks
+    ))
+    rs_map = RS_CACHE.get("by_symbol", {})
     eligible = []
- 
-    for stock in stocks:
+    for stock, average in zip(stocks, averages):
         rs_row = rs_map.get(stock["symbol"])
-        if not rs_row:
+        if not rs_row or average is None or average <= 0:
             continue
- 
-        liquidity_score = volume_score.get(stock["symbol"], 0.0)
-        group = group_stats.get(stock["group"], {})
-        group_score = group.get("group_score", 0.0)
+        # Current value and history both use price*volume proxy, in VND.
+        # Do not convert volume units without verified upstream schema.
+        current_value = stock["price"] * stock["volume"]
+        ratio = current_value / average
+        liquidity_score = min(100.0, 50.0 * ratio)
         rs_rating = rs_row["rs_rating"]
- 
-        # Normalize 1..99 RS rating to 0..100 before applying 40%.
         rs_score_100 = (rs_rating - 1) / 98 * 100
- 
-        leader_score = (
-            0.40 * rs_score_100
-            + 0.30 * liquidity_score
-            + 0.30 * group_score
-        )
- 
-        stock["rs_rating"] = rs_rating
-        stock["rs_percentile"] = rs_row["rs_percentile"]
-        stock["p_score"] = rs_row["p_score"]
-        stock["return_3m_pct"] = rs_row["return_3m_pct"]
-        stock["return_6m_pct"] = rs_row["return_6m_pct"]
-        stock["return_9m_pct"] = rs_row["return_9m_pct"]
-        stock["return_12m_pct"] = rs_row["return_12m_pct"]
-        stock["liquidity_score"] = round(liquidity_score, 2)
-        stock["group_breadth_score"] = round(
-            group.get("breadth_score", 0.0),
-            2,
-        )
-        stock["group_score"] = round(group_score, 2)
-        stock["leader_score"] = round(leader_score, 2)
-        stock["eligible_default"] = (
-            stock["price"] >= min_price
-            and stock["volume_ma10"] is not None
-            and stock["volume_ma10"] >= min_volume
-        )
- 
-        if stock["eligible_default"]:
-            eligible.append(stock)
- 
-    eligible.sort(
-        key=lambda x: (
-            x["leader_score"],
-            x["rs_rating"],
-            x["liquidity_score"],
-        ),
-        reverse=True,
-    )
- 
-    def compact(stock):
-        return {
+        leader_score = 0.60 * rs_score_100 + 0.40 * liquidity_score
+        if stock["price"] < min_price or average < min_value_billion * 1_000_000_000:
+            continue
+        eligible.append({
             "symbol": stock["symbol"],
             "price": stock["price"],
             "change_pct": stock["change_pct"],
             "volume": stock["volume"],
-            "average_volume_10_sessions": (
-                round(stock["volume_ma10"], 2)
-                if stock["volume_ma10"] is not None else None
-            ),
-            "group": stock["group"],
-            "icb_code": stock["icb_code"],
-            "rs_rating": stock["rs_rating"],
-            "rs_percentile": stock["rs_percentile"],
-            "p_score": stock["p_score"],
-            "return_3m_pct": stock["return_3m_pct"],
-            "return_6m_pct": stock["return_6m_pct"],
-            "return_9m_pct": stock["return_9m_pct"],
-            "return_12m_pct": stock["return_12m_pct"],
-            "liquidity_score": stock["liquidity_score"],
-            "group_breadth_score": stock["group_breadth_score"],
-            "group_score": stock["group_score"],
-            "leader_score": stock["leader_score"],
-            "volume_source": stock["volume_source"],
-        }
- 
+            "current_value_billion_estimated": round(current_value / 1e9, 3),
+            "average_previous_10_value_billion_estimated": round(average / 1e9, 3),
+            "liquidity_ratio": round(ratio, 4),
+            "liquidity_score": round(liquidity_score, 2),
+            "rs_rating": rs_rating,
+            "rs_score_100": round(rs_score_100, 2),
+            "rs_percentile": rs_row.get("rs_percentile"),
+            "p_score": rs_row.get("p_score"),
+            "return_3m_pct": rs_row.get("return_3m_pct"),
+            "return_6m_pct": rs_row.get("return_6m_pct"),
+            "return_9m_pct": rs_row.get("return_9m_pct"),
+            "return_12m_pct": rs_row.get("return_12m_pct"),
+            "leader_score": round(leader_score, 2),
+            "current_volume_source": stock.get("volume_source"),
+        })
+    eligible.sort(key=lambda x: (x["leader_score"], x["rs_rating"], x["liquidity_score"]), reverse=True)
     return {
-        "source": "VCI + DNSE",
+        "source": "VCI current quote + DNSE daily OHLCV",
         "status": "OK",
-        "version": "LEADER_V5",
-        "weights": {
-            "rs_rating": 0.40,
-            "liquidity": 0.30,
-            "group_strength": 0.30,
-        },
-        "rs_engine": {
-            "version": "RS_BATCH_V2",
-            "eligible_symbols": RS_CACHE.get("eligible_symbols", 0),
-            "vnindex_in_formula": False,
-        },
-        "screen": {
-            "min_price": min_price,
-            "min_volume": min_volume,
-            "min_volume_basis": "average daily volume over latest 10 sessions",
-            "volume_average_sessions": 10,
-        },
+        "version": "LEADER_V7_RS60_VALUE_RATIO40",
+        "weights": {"rs": 0.60, "liquidity": 0.40},
+        "group_strength_in_formula": False,
+        "liquidity_formula": "min(100, 50 * (current_value / previous_10_session_avg_value))",
+        "value_method": "ESTIMATED close_or_match_price_times_volume; NOT exact exchange traded value",
+        "warning": "Check VCI and DNSE price/volume units before trusting liquidity ratios; live API units not verified.",
+        "screen": {"min_price": min_price, "min_value_billion": min_value_billion, "average_sessions": 10, "exclude_current_session": True},
         "priced_stocks": len(stocks),
         "eligible_leader_stocks": len(eligible),
-        "top_leaders": [
-            compact(stock)
-            for stock in eligible[:top_n]
-        ],
-        "mapping_status": icb["status"],
-        "mapping_error": icb["error"],
-        "failed_batch_details": data["failed_batch_details"],
+        "top_leaders": eligible[:top_n],
+        "failed_batch_details": data.get("failed_batch_details", []),
     }
  
  
@@ -1521,10 +1568,10 @@ async def _initialize_rs_batch_run(days=600, concurrency=8, limit=100, batch_siz
         "results": [],
     }
  
-    # RAM-only mode: checkpoint persistence is intentionally skipped.
-    # Do not block RS initialization because the no-op saver returns False.
-    _save_rs_checkpoint([])
-    RS_CACHE["checkpoint_saved_at"] = None
+    if not _save_rs_checkpoint([]):
+        raise RuntimeError("Could not save RS checkpoint")
+ 
+    RS_CACHE["checkpoint_saved_at"] = time.time()
     return batches
  
  
@@ -1535,7 +1582,8 @@ async def _process_rs_batch(batch_number: int):
     global RS_CACHE
  
     if RS_CACHE.get("requested_symbols", 0) == 0:
-        return {"status": "EMPTY", "message": "Run /rs-refresh first; this deployment uses RAM-only RS state"}
+        if not _restore_rs_checkpoint():
+            return {"status": "EMPTY", "message": "Run /rs-refresh first"}
  
     total_batches = RS_CACHE.get("total_batches", 0)
     if batch_number < 1 or batch_number > total_batches:
@@ -1617,10 +1665,10 @@ async def _process_rs_batch(batch_number: int):
             {"symbol": item["symbol"], "error": item.get("error")}
             for item in all_results if item.get("status") == "ERROR"
         ][:50]
-        # RAM-only mode: keep results in RS_CACHE; checkpoint is deliberately skipped.
-        _save_rs_checkpoint(all_results)
-        RS_CACHE["checkpoint_saved_at"] = None
-        RS_CACHE["checkpoint_persisted"] = False
+        RS_CACHE["checkpoint_saved_at"] = time.time()
+        if not _save_rs_checkpoint(all_results):
+            RS_CACHE["last_batch_status"] = "CHECKPOINT_FAILED"
+            RS_CACHE["errors"].append({"error": "Checkpoint save failed"})
  
         batch_elapsed = round((time.perf_counter() - started) * 1000, 1)
         next_batch = batch_number + 1 if batch_number < total_batches else None
@@ -1706,7 +1754,8 @@ async def rs_finalize():
     global RS_CACHE
  
     if RS_CACHE.get("requested_symbols", 0) == 0:
-        return {"status": "EMPTY", "message": "Run /rs-refresh first; this deployment uses RAM-only RS state"}
+        if not _restore_rs_checkpoint():
+            return {"status": "EMPTY", "message": "Run /rs-refresh first"}
  
     if RS_CACHE.get("completed_batches", 0) != RS_CACHE.get("total_batches", 0):
         return {
@@ -1728,13 +1777,12 @@ async def rs_finalize():
     RS_CACHE["elapsed_ms"] = round(
         (time.perf_counter() - started) * 1000, 1
     )
-    _save_rs_checkpoint(all_results)
+    checkpoint_ok = _save_rs_checkpoint(all_results)
  
     return {
         "status": RS_CACHE["status"],
-        "checkpoint_mode": CHECKPOINT_MODE,
-        "checkpoint_persisted": False,
-        "checkpoint_saved_at": None,
+        "checkpoint_persisted": checkpoint_ok,
+        "checkpoint_saved_at": RS_CACHE.get("checkpoint_saved_at"),
         "checkpoint_error": RS_CACHE.get("checkpoint_error"),
         "ranking_status": "FINAL",
         "requested_symbols": RS_CACHE["requested_symbols"],
@@ -1750,6 +1798,8 @@ async def rs_finalize():
  
 @app.get("/rs-status")
 async def rs_status():
+    if RS_CACHE.get("requested_symbols", 0) == 0:
+        _restore_rs_checkpoint()
  
     processed = RS_CACHE.get("processed_symbols", 0)
     requested = RS_CACHE.get("requested_symbols", 0)
@@ -1772,10 +1822,10 @@ async def rs_status():
         "completed_batches": RS_CACHE.get("completed_batches", 0),
         "total_batches": RS_CACHE.get("total_batches", 0),
         "last_batch_status": RS_CACHE.get("last_batch_status"),
-        "checkpoint_saved_at": None,
+        "checkpoint_saved_at": RS_CACHE.get("checkpoint_saved_at"),
         "checkpoint_persisted": bool(RS_CACHE.get("checkpoint_persisted", False)),
         "checkpoint_error": RS_CACHE.get("checkpoint_error"),
-        "checkpoint_mode": CHECKPOINT_MODE,
+        "checkpoint_file": f"GitHub:{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/{GITHUB_CHECKPOINT_PATH}",
         "minimum_candles": RS_CACHE.get("minimum_candles", 251),
         "formula": RS_CACHE.get("formula"),
         "vnindex_in_formula": False,
@@ -1789,7 +1839,7 @@ async def rs_status():
 # ---------------------------------------------------------------------------
 # RS BATCH V5: STATELESS BATCH API
 # The browser carries the run manifest/results in localStorage. Each HTTP
-# batch request is self-contained; only final RS/Leaders state is kept in RAM.
+# batch request is self-contained and does not depend on server RAM/files.
 # ---------------------------------------------------------------------------
  
 class RSBatchRequest(BaseModel):
@@ -1947,13 +1997,12 @@ async def rs_finalize_client(payload: RSFinalizeRequest):
         "history_counts": [r.get("count", 0) for r in ordered_results if r.get("count", 0) > 0],
         "results": ordered_results,
     }
-    # No external checkpoint write in temporary RAM-only mode.
-    _save_rs_checkpoint(ordered_results)
+    # GitHub is the durable checkpoint for Render Free (ephemeral local disk).
+    checkpoint_ok = _save_rs_checkpoint(ordered_results)
     return {
         "status": RS_CACHE["status"],
-        "checkpoint_mode": CHECKPOINT_MODE,
-        "checkpoint_persisted": False,
-        "checkpoint_saved_at": None,
+        "checkpoint_persisted": checkpoint_ok,
+        "checkpoint_saved_at": RS_CACHE.get("checkpoint_saved_at"),
         "checkpoint_error": RS_CACHE.get("checkpoint_error"),
         "ranking_status": "FINAL",
         "requested_symbols": completed,
@@ -2195,7 +2244,8 @@ async def rs_reset():
     global RS_CACHE
     if RS_CACHE.get("status") in ("RUNNING_BATCH",):
         return {"status": "RUNNING", "message": "Cannot reset while a batch is running"}
-    _delete_rs_checkpoint()
+    if not _delete_rs_checkpoint():
+        return {"status": "ERROR", "message": "Could not delete GitHub checkpoint", "detail": RS_CACHE.get("checkpoint_error")}
     RS_CACHE = {
         "status": "EMPTY", "ranking_status": "NOT_READY", "started_at": None,
         "finished_at": None, "elapsed_ms": None, "requested_symbols": 0,
@@ -2363,4 +2413,6 @@ async def rs_history_test(
 async def _restore_rs_checkpoint_on_startup():
     """Restore the last RS cache after a Render restart/deploy when disk persists."""
     global RS_CACHE
+    if RS_CACHE.get("requested_symbols", 0) == 0:
+        _restore_rs_checkpoint()
  
