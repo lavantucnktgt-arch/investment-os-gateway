@@ -128,117 +128,26 @@ def _github_preflight():
  
  
 def _save_rs_checkpoint(all_results):
-    """Compress and save the complete RS checkpoint in the configured GitHub repo."""
-    payload = {
-        "schema_version": 1,
-        "saved_at": time.time(),
-        "cache": {
-            key: value for key, value in RS_CACHE.items()
-            if key not in ("rows", "by_symbol", "results")
-        },
-        "results": all_results,
-    }
-    try:
-        compressed = gzip.compress(
-            json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-        )
-        encoded = base64.b64encode(compressed).decode("ascii")
-        # GitHub Contents API receives Base64 text inside JSON; guard the
-        # encoded payload (not only the compressed bytes) below 1 MB.
-        if len(encoded.encode("ascii")) > 950_000:
-            RS_CACHE["checkpoint_error"] = (
-                "Checkpoint Base64 vượt ngưỡng an toàn 950 KB của GitHub Contents API"
-            )
-            return False
-        preflight_error = _github_preflight()
-        if preflight_error:
-            RS_CACHE["checkpoint_persisted"] = False
-            RS_CACHE["checkpoint_error"] = preflight_error
-            return False
-        existing, error = _github_contents_request("GET")
-        sha = existing.get("sha") if existing else None
-        if error not in (None, "HTTP 404"):
-            RS_CACHE["checkpoint_persisted"] = False
-            RS_CACHE["checkpoint_error"] = f"Checkpoint lookup failed: {error}"
-            return False
-        body = {
-            "message": f"Investment OS: update RS checkpoint ({int(time.time())})",
-            "content": encoded,
-            "branch": GITHUB_BRANCH,
-        }
-        if sha:
-            body["sha"] = sha
-        saved, save_error = _github_contents_request("PUT", body)
-        if save_error or not saved or not saved.get("content", {}).get("sha"):
-            RS_CACHE["checkpoint_persisted"] = False
-            RS_CACHE["checkpoint_error"] = (
-                f"Checkpoint PUT failed: {save_error or 'GitHub did not confirm checkpoint commit'}"
-            )
-            return False
-        RS_CACHE["checkpoint_persisted"] = True
-        RS_CACHE["checkpoint_error"] = None
-        RS_CACHE["checkpoint_saved_at"] = payload["saved_at"]
-        return True
-    except Exception as exc:
-        RS_CACHE["checkpoint_persisted"] = False
-        RS_CACHE["checkpoint_error"] = f"Checkpoint serialization failed: {type(exc).__name__}"
-        return False
+    """RAM-only mode: accept the checkpoint step without contacting GitHub."""
+    RS_CACHE["checkpoint_persisted"] = False
+    RS_CACHE["checkpoint_saved_at"] = None
+    RS_CACHE["checkpoint_error"] = None
+    RS_CACHE["storage_mode"] = "RAM_ONLY"
+    RS_CACHE["storage_note"] = "RS data is held in Render memory and is lost on restart."
+ 
+    # Return True so RS initialization/batches are not blocked by GitHub.
+    return True
  
  
 def _restore_rs_checkpoint():
-    """Restore RS state from GitHub; never silently treat API errors as an empty checkpoint."""
-    global RS_CACHE
-    remote, error = _github_contents_request("GET")
-    if error == "HTTP 404":
-        RS_CACHE["checkpoint_persisted"] = False
-        RS_CACHE["checkpoint_error"] = "Chưa có checkpoint trên GitHub"
-        return False
-    if error:
-        RS_CACHE["checkpoint_persisted"] = False
-        RS_CACHE["checkpoint_error"] = f"Checkpoint restore failed: {error}"
-        return False
-    try:
-        content = remote.get("content", "")
-        compressed = base64.b64decode(content)
-        payload = json.loads(gzip.decompress(compressed).decode("utf-8"))
-        if payload.get("schema_version") != 1:
-            raise ValueError("Unsupported checkpoint schema")
-        cache = payload.get("cache")
-        results = payload.get("results")
-        if not isinstance(cache, dict) or not isinstance(results, list):
-            raise ValueError("Invalid checkpoint structure")
-        RS_CACHE.update(cache)
-        RS_CACHE["results"] = results
-        partial_rows = _build_rs_rows(results)
-        RS_CACHE["rows"] = partial_rows
-        RS_CACHE["by_symbol"] = {row["symbol"]: row for row in partial_rows}
-        RS_CACHE["checkpoint_persisted"] = True
-        RS_CACHE["checkpoint_error"] = None
-        RS_CACHE["checkpoint_saved_at"] = payload.get("saved_at")
-        return True
-    except Exception as exc:
-        RS_CACHE["checkpoint_persisted"] = False
-        RS_CACHE["checkpoint_error"] = f"Checkpoint restore failed: {type(exc).__name__}"
-        return False
+    """RAM-only mode: never attempt to restore state from GitHub."""
+    return False
  
  
 def _delete_rs_checkpoint():
-    """Delete the GitHub checkpoint when /rs-reset is explicitly requested."""
-    existing, error = _github_contents_request("GET")
-    if error == "HTTP 404":
-        return True
-    if error:
-        RS_CACHE["checkpoint_error"] = error
-        return False
-    deleted, delete_error = _github_contents_request("DELETE", {
-        "message": "Investment OS: reset RS checkpoint",
-        "sha": existing.get("sha"),
-        "branch": GITHUB_BRANCH,
-    })
-    if delete_error:
-        RS_CACHE["checkpoint_error"] = delete_error
-        return False
+    """RAM-only mode: nothing is stored remotely, so reset is always local."""
     return True
+ 
  
 def _float(value, default=0.0):
     try:
@@ -1301,7 +1210,7 @@ async def leaders(
     if RS_CACHE.get("status") not in ("OK", "PARTIAL"):
         return {
             "source": "Investment OS", "status": "DATA_INSUFFICIENT",
-            "version": "LEADER_V7_RS60_VALUE_RATIO40",
+            "version": "LEADER_V7_1_RS60_VALUE_RATIO40_RAM_ONLY",
             "reason": "RS cache is not ready", "next": "Check /rs-status",
         }
  
@@ -1361,7 +1270,7 @@ async def leaders(
     return {
         "source": "VCI current quote + DNSE daily OHLCV",
         "status": "OK",
-        "version": "LEADER_V7_RS60_VALUE_RATIO40",
+        "version": "LEADER_V7_1_RS60_VALUE_RATIO40_RAM_ONLY",
         "weights": {"rs": 0.60, "liquidity": 0.40},
         "group_strength_in_formula": False,
         "liquidity_formula": "min(100, 50 * (current_value / previous_10_session_avg_value))",
@@ -1567,11 +1476,8 @@ async def _initialize_rs_batch_run(days=600, concurrency=8, limit=100, batch_siz
         "history_counts": [],
         "results": [],
     }
- 
-    if not _save_rs_checkpoint([]):
-        raise RuntimeError("Could not save RS checkpoint")
- 
-    RS_CACHE["checkpoint_saved_at"] = time.time()
+    # RAM-only: do not require a GitHub checkpoint to start RS processing.
+    _save_rs_checkpoint([])
     return batches
  
  
@@ -1781,7 +1687,7 @@ async def rs_finalize():
  
     return {
         "status": RS_CACHE["status"],
-        "checkpoint_persisted": checkpoint_ok,
+        "checkpoint_persisted": False,
         "checkpoint_saved_at": RS_CACHE.get("checkpoint_saved_at"),
         "checkpoint_error": RS_CACHE.get("checkpoint_error"),
         "ranking_status": "FINAL",
@@ -1825,7 +1731,9 @@ async def rs_status():
         "checkpoint_saved_at": RS_CACHE.get("checkpoint_saved_at"),
         "checkpoint_persisted": bool(RS_CACHE.get("checkpoint_persisted", False)),
         "checkpoint_error": RS_CACHE.get("checkpoint_error"),
-        "checkpoint_file": f"GitHub:{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/{GITHUB_CHECKPOINT_PATH}",
+        "checkpoint_file": "RAM-only; no GitHub checkpoint",
+        "storage_mode": "RAM_ONLY",
+        "storage_note": "RS data is held in Render memory and is lost on restart.",
         "minimum_candles": RS_CACHE.get("minimum_candles", 251),
         "formula": RS_CACHE.get("formula"),
         "vnindex_in_formula": False,
@@ -2001,7 +1909,7 @@ async def rs_finalize_client(payload: RSFinalizeRequest):
     checkpoint_ok = _save_rs_checkpoint(ordered_results)
     return {
         "status": RS_CACHE["status"],
-        "checkpoint_persisted": checkpoint_ok,
+        "checkpoint_persisted": False,
         "checkpoint_saved_at": RS_CACHE.get("checkpoint_saved_at"),
         "checkpoint_error": RS_CACHE.get("checkpoint_error"),
         "ranking_status": "FINAL",
@@ -2244,8 +2152,6 @@ async def rs_reset():
     global RS_CACHE
     if RS_CACHE.get("status") in ("RUNNING_BATCH",):
         return {"status": "RUNNING", "message": "Cannot reset while a batch is running"}
-    if not _delete_rs_checkpoint():
-        return {"status": "ERROR", "message": "Could not delete GitHub checkpoint", "detail": RS_CACHE.get("checkpoint_error")}
     RS_CACHE = {
         "status": "EMPTY", "ranking_status": "NOT_READY", "started_at": None,
         "finished_at": None, "elapsed_ms": None, "requested_symbols": 0,
@@ -2411,8 +2317,6 @@ async def rs_history_test(
  
 @app.on_event("startup")
 async def _restore_rs_checkpoint_on_startup():
-    """Restore the last RS cache after a Render restart/deploy when disk persists."""
-    global RS_CACHE
-    if RS_CACHE.get("requested_symbols", 0) == 0:
-        _restore_rs_checkpoint()
+    """RAM-only mode: do not attempt GitHub restore on startup."""
+    return None
  
