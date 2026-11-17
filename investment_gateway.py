@@ -1204,22 +1204,27 @@ async def leaders(
 ):
     """Leaders = 60% normalized RS + 40% own-history liquidity ratio.
  
-    Liquidity ratio = estimated current turnover / mean estimated turnover
-    of the 10 PREVIOUS completed sessions; estimated turnover = price * volume.
+    Value is consistently estimated as price * volume, NOT exact exchange turnover.
+    Return counts and examples for every major exclusion reason.
     """
-    if RS_CACHE.get("status") not in ("OK", "PARTIAL"):
+    version = "LEADER_V7_2_RS60_VALUE_RATIO40_DIAGNOSTICS_RAM_ONLY"
+    if RS_CACHE.get("status") not in ("OK", "PARTIAL") or not RS_CACHE.get("by_symbol"):
         return {
             "source": "Investment OS", "status": "DATA_INSUFFICIENT",
-            "version": "LEADER_V7_1_RS60_VALUE_RATIO40_RAM_ONLY",
-            "reason": "RS cache is not ready", "next": "Check /rs-status",
+            "version": version,
+            "reason": "RS cache is not ready or has no by_symbol rows",
+            "rs_status": RS_CACHE.get("status"),
+            "rs_symbols": len(RS_CACHE.get("by_symbol", {})),
+            "next": "Check /rs-status and ensure RS finalize completed",
         }
  
     data = await _load_vci_stock_prices()
     if "error" in data:
-        return {"source": "VCI", "status": "ERROR", "error": data["error"]}
+        return {"source": "VCI", "status": "ERROR", "version": version, "error": data["error"]}
  
+    raw_price_rows = data.get("prices", [])
     stocks = []
-    for item in data["prices"]:
+    for item in raw_price_rows:
         row = _extract_stock_row(item)
         if row:
             row["symbol"] = str(row["symbol"]).upper()
@@ -1231,26 +1236,88 @@ async def leaders(
         for stock in stocks
     ))
     rs_map = RS_CACHE.get("by_symbol", {})
+    counts = {
+        "vci_price_rows": len(raw_price_rows),
+        "valid_price_volume_rows": len(stocks),
+        "missing_rs": 0,
+        "missing_history_or_invalid_average": 0,
+        "below_min_price": 0,
+        "below_min_average_value": 0,
+        "zero_or_invalid_current_volume": 0,
+        "eligible": 0,
+    }
+    sample_keys = (
+        "missing_rs", "missing_history_or_invalid_average",
+        "below_min_price", "below_min_average_value",
+        "zero_or_invalid_current_volume",
+    )
+    samples = {key: [] for key in sample_keys}
+ 
+    def add_sample(bucket, item):
+        if len(samples[bucket]) < 10:
+            samples[bucket].append(item)
+ 
     eligible = []
+    min_average_value = min_value_billion * 1_000_000_000
     for stock, average in zip(stocks, averages):
-        rs_row = rs_map.get(stock["symbol"])
-        if not rs_row or average is None or average <= 0:
+        symbol = stock["symbol"]
+        rs_row = rs_map.get(symbol)
+        if not rs_row:
+            counts["missing_rs"] += 1
+            add_sample("missing_rs", {"symbol": symbol})
             continue
-        # Current value and history both use price*volume proxy, in VND.
-        # Do not convert volume units without verified upstream schema.
-        current_value = stock["price"] * stock["volume"]
+        if average is None or average <= 0:
+            counts["missing_history_or_invalid_average"] += 1
+            add_sample("missing_history_or_invalid_average", {
+                "symbol": symbol, "average_previous_10_value": average
+            })
+            continue
+ 
+        price = _float(stock.get("price"))
+        volume = _float(stock.get("volume"), -1)
+        if price <= 0 or volume <= 0:
+            counts["zero_or_invalid_current_volume"] += 1
+            add_sample("zero_or_invalid_current_volume", {
+                "symbol": symbol, "price": price, "volume": volume,
+                "volume_source": stock.get("volume_source")
+            })
+            continue
+ 
+        current_value = price * volume
         ratio = current_value / average
-        liquidity_score = min(100.0, 50.0 * ratio)
-        rs_rating = rs_row["rs_rating"]
+        liquidity_score = min(100.0, max(0.0, 50.0 * ratio))
+ 
+        if price < min_price:
+            counts["below_min_price"] += 1
+            add_sample("below_min_price", {
+                "symbol": symbol, "price": price, "minimum": min_price
+            })
+            continue
+        if average < min_average_value:
+            counts["below_min_average_value"] += 1
+            add_sample("below_min_average_value", {
+                "symbol": symbol,
+                "average_previous_10_value_billion_estimated": round(average / 1e9, 3),
+                "minimum_billion": min_value_billion
+            })
+            continue
+ 
+        rs_rating = _float(rs_row.get("rs_rating"), 0)
+        if not 1 <= rs_rating <= 99:
+            counts["missing_rs"] += 1
+            add_sample("missing_rs", {
+                "symbol": symbol, "reason": "invalid_rs_rating",
+                "rs_rating": rs_row.get("rs_rating")
+            })
+            continue
+ 
         rs_score_100 = (rs_rating - 1) / 98 * 100
         leader_score = 0.60 * rs_score_100 + 0.40 * liquidity_score
-        if stock["price"] < min_price or average < min_value_billion * 1_000_000_000:
-            continue
         eligible.append({
-            "symbol": stock["symbol"],
-            "price": stock["price"],
-            "change_pct": stock["change_pct"],
-            "volume": stock["volume"],
+            "symbol": symbol,
+            "price": price,
+            "change_pct": stock.get("change_pct"),
+            "volume": int(volume),
             "current_value_billion_estimated": round(current_value / 1e9, 3),
             "average_previous_10_value_billion_estimated": round(average / 1e9, 3),
             "liquidity_ratio": round(ratio, 4),
@@ -1266,22 +1333,43 @@ async def leaders(
             "leader_score": round(leader_score, 2),
             "current_volume_source": stock.get("volume_source"),
         })
-    eligible.sort(key=lambda x: (x["leader_score"], x["rs_rating"], x["liquidity_score"]), reverse=True)
+ 
+    counts["eligible"] = len(eligible)
+    eligible.sort(
+        key=lambda x: (x["leader_score"], x["rs_rating"], x["liquidity_score"]),
+        reverse=True
+    )
     return {
         "source": "VCI current quote + DNSE daily OHLCV",
         "status": "OK",
-        "version": "LEADER_V7_1_RS60_VALUE_RATIO40_RAM_ONLY",
+        "version": version,
         "weights": {"rs": 0.60, "liquidity": 0.40},
         "group_strength_in_formula": False,
-        "liquidity_formula": "min(100, 50 * (current_value / previous_10_session_avg_value))",
-        "value_method": "ESTIMATED close_or_match_price_times_volume; NOT exact exchange traded value",
-        "warning": "Check VCI and DNSE price/volume units before trusting liquidity ratios; live API units not verified.",
-        "screen": {"min_price": min_price, "min_value_billion": min_value_billion, "average_sessions": 10, "exclude_current_session": True},
+        "liquidity_formula": "min(100, 50 * current_estimated_value / previous_10_session_average_estimated_value)",
+        "value_method": "ESTIMATED price * volume; NOT exact exchange traded value",
+        "warning": (
+            "Estimated traded value only. Verify VCI/DNSE live price and volume units "
+            "before treating the values as exact GTGD."
+        ),
+        "screen": {
+            "min_price": min_price,
+            "min_average_value_billion": min_value_billion,
+            "average_sessions": 10,
+            "exclude_current_session_from_average": True
+        },
+        "counts": counts,
+        "exclusion_samples": samples,
+        "rs_cache": {
+            "status": RS_CACHE.get("status"),
+            "symbols": len(rs_map),
+            "ranking_status": RS_CACHE.get("ranking_status")
+        },
         "priced_stocks": len(stocks),
         "eligible_leader_stocks": len(eligible),
         "top_leaders": eligible[:top_n],
         "failed_batch_details": data.get("failed_batch_details", []),
     }
+ 
  
  
 async def _load_rs_history_batch(
