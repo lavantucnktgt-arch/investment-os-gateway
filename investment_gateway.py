@@ -1344,7 +1344,7 @@ async def leaders(
     if RS_CACHE.get("status") not in ("OK", "PARTIAL") or RS_CACHE.get("ranking_status") != "FINAL":
         return {
             "source": "Investment OS", "status": "DATA_INSUFFICIENT",
-            "version": "LEADER_V7_3_RS60_VALUE_RATIO40_GITHUB_CHECKPOINT",
+            "version": "LEADER_V7_4_RS60_VALUE_RATIO40_GITHUB_CHECKPOINT",
             "reason": "RS cache is not ready", "next": "Check /rs-status",
         }
  
@@ -1404,7 +1404,7 @@ async def leaders(
     return {
         "source": "VCI current quote + DNSE daily OHLCV",
         "status": "OK",
-        "version": "LEADER_V7_3_RS60_VALUE_RATIO40_GITHUB_CHECKPOINT",
+        "version": "LEADER_V7_4_RS60_VALUE_RATIO40_GITHUB_CHECKPOINT",
         "weights": {"rs": 0.60, "liquidity": 0.40},
         "group_strength_in_formula": False,
         "liquidity_formula": "min(100, 50 * (current_value / previous_10_session_avg_value))",
@@ -1821,9 +1821,10 @@ async def rs_finalize():
  
     return {
         "status": RS_CACHE["status"],
-        "checkpoint_persisted": False,
+        "checkpoint_persisted": bool(checkpoint_ok),
         "checkpoint_saved_at": RS_CACHE.get("checkpoint_saved_at"),
         "checkpoint_error": RS_CACHE.get("checkpoint_error"),
+        "storage_mode": RS_CACHE.get("storage_mode", "GITHUB_CHECKPOINT"),
         "ranking_status": "FINAL",
         "requested_symbols": RS_CACHE["requested_symbols"],
         "processed_symbols": RS_CACHE["processed_symbols"],
@@ -1865,9 +1866,12 @@ async def rs_status():
         "checkpoint_saved_at": RS_CACHE.get("checkpoint_saved_at"),
         "checkpoint_persisted": bool(RS_CACHE.get("checkpoint_persisted", False)),
         "checkpoint_error": RS_CACHE.get("checkpoint_error"),
-        "checkpoint_file": "RAM-only; no GitHub checkpoint",
-        "storage_mode": "RAM_ONLY",
-        "storage_note": "Final RS data is stored in GitHub and restored after Render restart.",
+        "checkpoint_file": "GitHub RS checkpoint",
+        "storage_mode": RS_CACHE.get("storage_mode", "GITHUB_CHECKPOINT"),
+        "storage_note": RS_CACHE.get(
+            "storage_note",
+            "RS data remains in RAM until a GitHub checkpoint is successfully saved."
+        ),
         "minimum_candles": RS_CACHE.get("minimum_candles", 251),
         "formula": RS_CACHE.get("formula"),
         "vnindex_in_formula": False,
@@ -2462,4 +2466,3 @@ async def _restore_rs_checkpoint_on_startup():
     """Restore finalized RS state from GitHub whenever this Render process starts."""
     _restore_rs_checkpoint()
     return None
- 
