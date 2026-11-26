@@ -40,12 +40,12 @@ VCI_HEADERS = {
 # The environment variable can override this path if your disk uses another mount.
 # GitHub checkpoint storage: compatible with Render Free (no persistent disk required).
 # Configure GITHUB_TOKEN in Render. These defaults match the Investment OS repository.
-GITHUB_REPO_OWNER = os.getenv("GITHUB_REPO_OWNER", "lavantuncktgt-arch")
-GITHUB_REPO_NAME = os.getenv("GITHUB_REPO_NAME", "investment-os-gateway")
-GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main")
+GITHUB_REPO_OWNER = os.getenv("GITHUB_REPO_OWNER", "lavantuncktgt-arch").strip()
+GITHUB_REPO_NAME = os.getenv("GITHUB_REPO_NAME", "investment-os-gateway").strip()
+GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main").strip()
 GITHUB_CHECKPOINT_PATH = os.getenv(
     "GITHUB_CHECKPOINT_PATH", "data/rs_batch_v4_checkpoint.json.gz"
-)
+).strip()
 GITHUB_API_BASE = "https://api.github.com"
  
  
@@ -121,6 +121,21 @@ def _github_preflight():
             detail = f"GitHub preflight {label} failed: HTTP {exc.code}"
             if message:
                 detail += f": {message}"
+            if exc.code == 404 and label == "repository":
+                detail += (
+                    ". GitHub cannot see this repository with the token supplied by Render. "
+                    "Recheck that Render GITHUB_TOKEN is the active fine-grained token "
+                    "authorized for this exact repository, and that owner/repository values match."
+                )
+            elif exc.code == 404 and label == "branch":
+                detail += (
+                    f". Repository is visible, but branch '{GITHUB_BRANCH}' was not found. "
+                    "Set GITHUB_BRANCH to the repository's actual default branch."
+                )
+            elif exc.code == 401:
+                detail += ". The Render token is invalid, expired, or revoked."
+            elif exc.code == 403:
+                detail += ". The Render token lacks permission to read this repository."
             return detail
         except Exception as exc:
             return f"GitHub preflight {label} request failed: {type(exc).__name__}"
@@ -1344,7 +1359,7 @@ async def leaders(
     if RS_CACHE.get("status") not in ("OK", "PARTIAL") or RS_CACHE.get("ranking_status") != "FINAL":
         return {
             "source": "Investment OS", "status": "DATA_INSUFFICIENT",
-            "version": "LEADER_V7_4_RS60_VALUE_RATIO40_GITHUB_CHECKPOINT",
+            "version": "LEADER_V7_5_RS60_VALUE_RATIO40_GITHUB_CHECKPOINT",
             "reason": "RS cache is not ready", "next": "Check /rs-status",
         }
  
@@ -1404,7 +1419,7 @@ async def leaders(
     return {
         "source": "VCI current quote + DNSE daily OHLCV",
         "status": "OK",
-        "version": "LEADER_V7_4_RS60_VALUE_RATIO40_GITHUB_CHECKPOINT",
+        "version": "LEADER_V7_5_RS60_VALUE_RATIO40_GITHUB_CHECKPOINT",
         "weights": {"rs": 0.60, "liquidity": 0.40},
         "group_strength_in_formula": False,
         "liquidity_formula": "min(100, 50 * (current_value / previous_10_session_avg_value))",
